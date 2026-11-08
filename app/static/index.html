@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- MANDATORY: Declare support for both light and dark themes to avoid FOUC -->
+    <meta name="color-scheme" content="light dark" />
+    <title>OFD1 Streamway — Caver Flood Forecast & Telemetry</title>
+    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
+    <script src="/static/app.js?v=3" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="site-header">
+        <div class="header-brand">
+          <div class="brand-badge">OFD1</div>
+          <div>
+            <h1>Ogof Ffynnon Ddu 1 — Streamway Forecast</h1>
+            <p class="subtitle">
+              Karst Hydrological Nowcast (+1–6h) &amp; NWP-Coupled Outlook (+12–48h) • Downstream of
+              <em>The Step</em> (ThingSpeak #2574933)
+            </p>
+          </div>
+        </div>
+        <div class="header-actions">
+          <span id="sync-badge" class="sync-pill">Syncing telemetry…</span>
+          <button id="refresh-btn" type="button" class="btn-secondary">Refresh Now</button>
+        </div>
+      </header>
+
+      <!-- Safety Alert Banner -->
+      <section id="alert-banner" class="alert-banner alert-green" aria-live="polite">
+        <div class="alert-indicator" id="alert-pill">GREEN</div>
+        <div class="alert-copy">
+          <h2 id="alert-headline">Loading streamway safety status…</h2>
+          <p id="alert-subtext">Evaluating current level, peat bog saturation, and 48h forecast…</p>
+        </div>
+        <div class="alert-countdown">
+          <span class="countdown-label" id="countdown-label">Threshold Outlook</span>
+          <strong class="countdown-value" id="countdown-value">—</strong>
+        </div>
+      </section>
+
+      <!-- KPI Metric Grid using CSS Grid + Subgrid & Container Queries -->
+      <section class="kpi-grid" aria-label="Key Streamway Telemetry Metrics">
+        <article class="kpi-card">
+          <header class="kpi-header">
+            <span class="kpi-title">Current Streamway Depth</span>
+            <span class="kpi-tag" id="kpi-regime-tag">—</span>
+          </header>
+          <div class="kpi-body">
+            <div class="kpi-primary" id="kpi-depth-mm">— mm</div>
+            <p class="kpi-meta" id="kpi-step-inches">— over The Step (550 mm datum)</p>
+          </div>
+        </article>
+
+        <article class="kpi-card">
+          <header class="kpi-header">
+            <span class="kpi-title">1h / 3h Rate of Change</span>
+            <span class="kpi-tag">T<sub>c</sub> = 2.0h</span>
+          </header>
+          <div class="kpi-body">
+            <div class="kpi-primary" id="kpi-ddepth">— mm/h</div>
+            <p class="kpi-meta" id="kpi-baseflow">30d Baseflow Datum: — mm</p>
+          </div>
+        </article>
+
+        <article class="kpi-card">
+          <header class="kpi-header">
+            <span class="kpi-title">Fan Gyhirych Peat Saturation</span>
+            <span class="kpi-tag" id="kpi-peat-tag">Slow Tank (120h)</span>
+          </header>
+          <div class="kpi-body">
+            <div class="kpi-primary" id="kpi-moisture">—%</div>
+            <p class="kpi-meta" id="kpi-rain-recent">Recent Rain: — mm (6h) / — mm (24h)</p>
+          </div>
+        </article>
+
+        <article class="kpi-card">
+          <header class="kpi-header">
+            <span class="kpi-title">24h Forecast Crest (P50 / P90)</span>
+            <span class="kpi-tag">700 mm = Red</span>
+          </header>
+          <div class="kpi-body">
+            <div class="kpi-primary" id="kpi-peak-24h">— / — mm</div>
+            <p class="kpi-meta" id="kpi-surface-wx">Surface: —°C, Wind — km/h, — hPa</p>
+          </div>
+        </article>
+      </section>
+
+      <!-- Navigation Tabs -->
+      <nav class="tab-bar" role="tablist" aria-label="Dashboard Views">
+        <button
+          role="tab"
+          aria-selected="true"
+          aria-controls="panel-forecast"
+          id="tab-forecast"
+          class="tab-btn active"
+          data-target="panel-forecast"
+        >
+          1. Live 48h Forecast &amp; Hydrograph
+        </button>
+        <button
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-verification"
+          id="tab-verification"
+          class="tab-btn"
+          data-target="panel-verification"
+        >
+          2. Historical Forecast Performance
+        </button>
+        <button
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-simulator"
+          id="tab-simulator"
+          class="tab-btn"
+          data-target="panel-simulator"
+        >
+          3. What-If Storm Simulator
+        </button>
+        <button
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-diagnostics"
+          id="tab-diagnostics"
+          class="tab-btn"
+          data-target="panel-diagnostics"
+        >
+          4. Phase 1 &amp; 2 Predictability &amp; Skill Limits
+        </button>
+      </nav>
+
+      <!-- TAB 1: Live 48h Forecast -->
+      <main id="panel-forecast" role="tabpanel" aria-labelledby="tab-forecast" class="tab-panel">
+        <section class="panel-card">
+          <div class="panel-header">
+            <div>
+              <h2>Streamway Hydrograph: Past 72h Observed &amp; Next 48h Forecast (P10–P90 Band)</h2>
+              <p class="panel-subtitle">
+                Shaded band represents the 80% quantile prediction interval (P10 lower bound to P90
+                conservative safety trigger). Red dashed line marks 700 mm (~6&quot; over The Step).
+              </p>
+            </div>
+          </div>
+          <div id="hydrograph-chart" class="chart-box chart-tall"></div>
+        </section>
+
+        <div class="two-col-grid">
+          <!-- Telemetry Gauge Status -->
+          <section class="panel-card">
+            <h2>Telemetry Logger Health &amp; Failover Status</h2>
+            <p class="panel-subtitle">
+              Real-time synchronization across underground pressure transducer, club tipping-bucket
+              gauges, and radar/NWP reanalysis fallback.
+            </p>
+            <div id="gauge-status-list" class="gauge-list"></div>
+          </section>
+
+          <!-- Horizon Forecast Summary Table (Responsive Container-Query Table) -->
+          <section class="panel-card">
+            <h2>Key Forecast Checkpoints (+1h to +48h)</h2>
+            <p class="panel-subtitle">
+              Use <strong>P90 Upper</strong> for conservative life-safety decisions (95–100% flood
+              onset recall) and <strong>P50 Median</strong> for expected streamway depth.
+            </p>
+            <div
+              tabindex="0"
+              role="region"
+              aria-labelledby="forecast-table-caption"
+              class="table-wrapper"
+            >
+              <table class="forecast-table">
+                <caption id="forecast-table-caption" class="sr-only">
+                  Forecast streamway depth checkpoints from +1h to +48h
+                </caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Horizon</th>
+                    <th scope="col">Time (UTC)</th>
+                    <th scope="col">P50 Depth</th>
+                    <th scope="col">P90 Safety</th>
+                    <th scope="col">Over Step</th>
+                    <th scope="col">Status</th>
+                  </tr>
+                </thead>
+                <tbody id="forecast-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </main>
+
+      <!-- TAB 2: Historical Forecast Performance & Verification Ledger -->
+      <section
+        id="panel-verification"
+        role="tabpanel"
+        aria-labelledby="tab-verification"
+        class="tab-panel"
+        hidden
+      >
+        <div class="panel-card">
+          <div class="verif-toolbar">
+            <div>
+              <h2>Stored Forecast Verification Ledger: Predicted vs. Actual Measured Depth</h2>
+              <p class="panel-subtitle">
+                Every forecast is persisted to the verification ledger on the PVC and automatically
+                reconciled against actual ThingSpeak sensor readings once the target hour arrives.
+              </p>
+            </div>
+            <div class="verif-filters">
+              <label class="select-field">
+                <span>Lead Horizon</span>
+                <select id="verif-horizon">
+                  <option value="1">+1 Hour Ahead</option>
+                  <option value="2" selected>+2 Hours Ahead (Primary Tc)</option>
+                  <option value="3">+3 Hours Ahead</option>
+                  <option value="6">+6 Hours Ahead</option>
+                  <option value="12">+12 Hours Ahead</option>
+                  <option value="24">+24 Hours Ahead</option>
+                </select>
+              </label>
+              <label class="select-field">
+                <span>Evaluation Window</span>
+                <select id="verif-window">
+                  <option value="recent_14d">Recent 14 Days (Out-of-Sample + Live)</option>
+                  <option value="oct_2026_floods" selected>
+                    Oct 2026 Floods &amp; Stump Glitch (Out-of-Sample)
+                  </option>
+                  <option value="aug_2026_dry_rain">
+                    Aug 2026 Summer &ldquo;Dry Rain&rdquo; (Out-of-Sample)
+                  </option>
+                  <option value="jan_feb_2026_winter">
+                    Jan–Feb 2026 Winter Floods (Out-of-Sample)
+                  </option>
+                  <option value="full_2026">
+                    Full 2026 Unseen Test Set (Jan–Nov 2026)
+                  </option>
+                  <option value="full_all_2024_2026">
+                    Full 2015–2026 Timeline (10.5yr Training + 2026 Out-of-Sample Split)
+                  </option>
+                  <option value="train_2024_2025">
+                    Training Window Only (Aug 2015 – Dec 2025 In-Sample)
+                  </option>
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <!-- Training vs Out-of-Sample Data Provenance Banner -->
+          <div class="split-provenance-box" aria-label="Training and Out-of-Sample Split Provenance">
+            <div class="split-segment split-train">
+              <div class="split-badge badge-train">TRAINING DATA (IN-SAMPLE)</div>
+              <div class="split-dates" id="split-train-dates">2015-08-30 → 2025-12-31 UTC</div>
+              <div class="split-stats" id="split-train-stats">Loading training split metrics…</div>
+            </div>
+            <div class="split-divider">
+              <span class="split-cutoff-pill">STRICT CUTOFF: 2026-01-01 00:00 UTC</span>
+              <span class="split-cutoff-note">Zero data leakage into 2026 evaluation</span>
+            </div>
+            <div class="split-segment split-test">
+              <div class="split-badge badge-test">OUT-OF-SAMPLE TEST &amp; LIVE (UNSEEN)</div>
+              <div class="split-dates" id="split-test-dates">2026-01-01 → Present UTC</div>
+              <div class="split-stats" id="split-test-stats">Loading out-of-sample metrics…</div>
+            </div>
+          </div>
+
+          <!-- 4-Card Verification KPI Grid -->
+          <div class="kpi-grid">
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">Mean Absolute Error (MAE)</span>
+                <span class="kpi-tag" id="verif-kpi-horizon-tag">+2h Lead</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="verif-kpi-mae">— mm</div>
+                <p class="kpi-meta" id="verif-kpi-rmse">RMSE: — mm</p>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">Hydrological Skill (NSE)</span>
+                <span class="kpi-tag">&gt;0.75 = Very Good</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="verif-kpi-nse">—</div>
+                <p class="kpi-meta" id="verif-kpi-skill">Skill vs. Persistence: —%</p>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">P10–P90 Band Coverage</span>
+                <span class="kpi-tag" id="verif-kpi-count-tag">— hours</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="verif-kpi-cov">—%</div>
+                <p class="kpi-meta">Percentage of actual depths inside P10–P90 band</p>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">&ge;700 mm Flood Alert Recall</span>
+                <span class="kpi-tag">Safety Trigger</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="verif-kpi-recall">—% / —%</div>
+                <p class="kpi-meta" id="verif-kpi-hits">Hits: — • False Alarms: — • Missed: —</p>
+              </div>
+            </article>
+          </div>
+
+          <div id="verif-hydro-chart" class="chart-box chart-tall"></div>
+        </div>
+
+        <div class="two-col-grid">
+          <section class="panel-card">
+            <h2>Multi-Horizon Accuracy Comparison (+1h to +24h)</h2>
+            <p class="panel-subtitle">
+              Side-by-side accuracy metrics across all stored forecast horizons for the selected
+              evaluation period.
+            </p>
+            <div
+              tabindex="0"
+              role="region"
+              aria-labelledby="verif-scorecard-caption"
+              class="table-wrapper"
+            >
+              <table class="forecast-table">
+                <caption id="verif-scorecard-caption" class="sr-only">
+                  Accuracy comparison across forecast horizons from +1h to +24h
+                </caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Horizon</th>
+                    <th scope="col">MAE</th>
+                    <th scope="col">RMSE</th>
+                    <th scope="col">NSE</th>
+                    <th scope="col">Skill vs Pers</th>
+                    <th scope="col">P90 Flood Recall</th>
+                  </tr>
+                </thead>
+                <tbody id="verif-scorecard-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel-card">
+            <h2>Recent Reconciled Forecast Audit Log</h2>
+            <p class="panel-subtitle">
+              Individual timestamped predictions issued <em>h</em> hours in advance compared against
+              subsequent pressure sensor measurements.
+            </p>
+            <div
+              tabindex="0"
+              role="region"
+              aria-labelledby="verif-audit-caption"
+              class="table-wrapper"
+            >
+              <table class="forecast-table">
+                <caption id="verif-audit-caption" class="sr-only">
+                  Reconciled historical forecast audit log
+                </caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Target (UTC)</th>
+                    <th scope="col">Split / Source</th>
+                    <th scope="col">Pred P50</th>
+                    <th scope="col">P10–P90 Band</th>
+                    <th scope="col">Actual</th>
+                    <th scope="col">Error</th>
+                    <th scope="col">Band</th>
+                  </tr>
+                </thead>
+                <tbody id="verif-audit-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <!-- Telemetry Stream Coverage Start/End Provenance Table -->
+        <section class="panel-card">
+          <h2>Telemetry &amp; Training Data Coverage Provenance (May 2024 – Present)</h2>
+          <p class="panel-subtitle">
+            Exact start/end timestamps, active hours, and modeling roles for every sensor stream in
+            the OFD1 dataset.
+          </p>
+          <div
+            tabindex="0"
+            role="region"
+            aria-labelledby="sensor-spans-caption"
+            class="table-wrapper"
+          >
+            <table class="forecast-table">
+              <caption id="sensor-spans-caption" class="sr-only">
+                Telemetry sensor stream start and end dates
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Telemetry Stream</th>
+                  <th scope="col">Start Timestamp (UTC)</th>
+                  <th scope="col">End Timestamp (UTC)</th>
+                  <th scope="col">Valid Hourly Obs</th>
+                  <th scope="col">Model Role &amp; Quality Notes</th>
+                </tr>
+              </thead>
+              <tbody id="sensor-spans-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <!-- TAB 3: What-If Storm Simulator -->
+      <section
+        id="panel-simulator"
+        role="tabpanel"
+        aria-labelledby="tab-simulator"
+        class="tab-panel"
+        hidden
+      >
+        <div class="panel-card">
+          <h2>Interactive &ldquo;Dry Rain&rdquo; &amp; Storm Pulse Simulator</h2>
+          <p class="panel-subtitle">
+            Test how the same 6-hour rainstorm behaves in <strong>August dry peat</strong> (sponge
+            absorbs runoff) vs. <strong>December saturated peat</strong> (flash conduit pulse over
+            700 mm).
+          </p>
+
+          <div class="sim-controls">
+            <div class="control-group">
+              <label for="sim-rain">
+                <span>6-Hour Cumulative Rainfall</span>
+                <strong id="sim-rain-val">15.0 mm</strong>
+              </label>
+              <input type="range" id="sim-rain" min="0" max="45" step="1" value="15" />
+              <span class="control-hint">15 mm in 6h = heavy frontal rainband</span>
+            </div>
+
+            <div class="control-group">
+              <label for="sim-moisture">
+                <span>Antecedent Peat Bog Saturation</span>
+                <strong id="sim-moisture-val">85% (Winter Wet)</strong>
+              </label>
+              <input type="range" id="sim-moisture" min="15" max="110" step="5" value="85" />
+              <span class="control-hint">20% = August dry spell • 85%+ = December saturated</span>
+            </div>
+
+            <div class="control-group">
+              <label for="sim-start-depth">
+                <span>Starting Streamway Depth</span>
+                <strong id="sim-start-val">580 mm</strong>
+              </label>
+              <input type="range" id="sim-start-depth" min="450" max="900" step="10" value="580" />
+              <span class="control-hint">530–580 mm = normal baseflow</span>
+            </div>
+
+            <div class="preset-buttons">
+              <button type="button" class="btn-secondary sim-preset" data-rain="15" data-moist="22" data-depth="520">
+                August 15mm (&ldquo;Dry Rain&rdquo;)
+              </button>
+              <button type="button" class="btn-secondary sim-preset" data-rain="15" data-moist="90" data-depth="600">
+                December 15mm (Saturated Pulse)
+              </button>
+              <button type="button" class="btn-secondary sim-preset" data-rain="30" data-moist="95" data-depth="650">
+                Severe Winter Gale (30mm)
+              </button>
+            </div>
+          </div>
+
+          <div id="sim-summary-bar" class="sim-summary"></div>
+          <div id="sim-chart" class="chart-box"></div>
+        </div>
+      </section>
+
+      <!-- TAB 3: Phase 1 & 2 Predictability & Horizon Breakdown -->
+      <section
+        id="panel-diagnostics"
+        role="tabpanel"
+        aria-labelledby="tab-diagnostics"
+        class="tab-panel"
+        hidden
+      >
+        <div class="two-col-grid">
+          <div class="panel-card">
+            <h2>Cross-Correlation (CCF): 2-Hour Time of Concentration</h2>
+            <p class="panel-subtitle">
+              Lagged correlation between hourly rainfall and ΔDepth peaks sharply at
+              <strong>+2 hours</strong> (The Stump <code>r = 0.513</code>, SWCC HQ
+              <code>r = 0.447</code>).
+            </p>
+            <div id="ccf-chart" class="chart-box"></div>
+          </div>
+
+          <div class="panel-card">
+            <h2>Autocorrelation (ACF): Recession vs. Flood Pulse Memory</h2>
+            <p class="panel-subtitle">
+              Falling water has smooth deterministic memory (<code>r = 0.926</code> at +6h), whereas
+              rising flood pulses break down rapidly without rain inputs.
+            </p>
+            <div id="acf-chart" class="chart-box"></div>
+          </div>
+        </div>
+
+        <div class="two-col-grid">
+          <div class="panel-card">
+            <h2>The &ldquo;Dry Rain&rdquo; Anomaly &amp; Peat Tank Tightening</h2>
+            <p class="panel-subtitle">
+              Weighting 6h storm rain by the leaky-bucket Peat Tank doubles explained variance
+              (<code>r = 0.578 → 0.815</code>).
+            </p>
+            <div id="dry-rain-chart" class="chart-box"></div>
+          </div>
+
+          <div class="panel-card">
+            <h2>Forecast Skill Limits (+1h to +48h Breakdown)</h2>
+            <p class="panel-subtitle">
+              Telemetry-only breaks down after +6–12h, whereas NWP-coupled forecasts preserve
+              <code>NSE ≥ 0.75</code> out to +36–48h.
+            </p>
+            <div id="horizon-chart" class="chart-box"></div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="site-footer">
+        <p>
+          <strong>Caver Safety Notice:</strong> Underground water in Ogof Ffynnon Ddu responds
+          rapidly to upland downpours. Always check live surface weather, visual stream conditions,
+          and club callout procedures before entering the cave.
+        </p>
+      </footer>
+    </div>
+  </body>
+</html>

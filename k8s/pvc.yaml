@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ofd1-telemetry-pvc
+  namespace: ofd1-forecast
+  labels:
+    app: ofd1-forecast
+  annotations:
+    volume.longhorn.io/replica-count: "2"
+spec:
+  storageClassName: longhorn-talos
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi

@@ -1,0 +1,29 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ofd1-forecast-ingress
+  namespace: ofd1-forecast
+  labels:
+    app.kubernetes.io/name: ofd1-forecast
+  annotations:
+    # Uncomment for cert-manager automatic TLS:
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  # Set ingressClassName to "traefik" or "nginx" depending on your 3-node cluster controller:
+  # ingressClassName: traefik
+  rules:
+    - host: ofd1.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ofd1-forecast-svc
+                port:
+                  name: http
+  # Uncomment for TLS:
+  # tls:
+  #   - hosts:
+  #       - ofd1.local
+  #     secretName: ofd1-forecast-tls

@@ -1,0 +1,153 @@
+# Drop this file into your flux-cd repo at:
+#   clusters/my-cluster/apps/ofd1-forecast/ofd1-forecast.yaml
+# and add "- ofd1-forecast/ofd1-forecast.yaml" to:
+#   clusters/my-cluster/apps/kustomization.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ofd1-forecast
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ofd1-telemetry-pvc
+  namespace: ofd1-forecast
+  labels:
+    app: ofd1-forecast
+  annotations:
+    volume.longhorn.io/replica-count: "2"
+spec:
+  storageClassName: longhorn-talos
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ofd1-forecast
+  namespace: ofd1-forecast
+  labels:
+    app: ofd1-forecast
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ofd1-forecast
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ofd1-forecast
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: app
+          image: ghcr.io/you-randomly/ofd1-forecast:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: TZ
+              value: Europe/London
+            - name: OFD1_DATA_DIR
+              value: "/data"
+            - name: OFD1_SEED_DIR
+              value: "/app/seed_data"
+            - name: OFD1_REFRESH_SECONDS
+              value: "600"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          volumeMounts:
+            - name: telemetry-data
+              mountPath: /data
+      volumes:
+        - name: telemetry-data
+          persistentVolumeClaim:
+            claimName: ofd1-telemetry-pvc
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ofd1-forecast
+  namespace: ofd1-forecast
+  labels:
+    app: ofd1-forecast
+spec:
+  selector:
+    app: ofd1-forecast
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: ofd1-forecast
+  namespace: ofd1-forecast
+spec:
+  hostnames:
+    - ofd1.lab.jake-watson.co.uk
+  parentRefs:
+    - name: cilium-gateway-external
+      namespace: default
+  rules:
+    - backendRefs:
+        - kind: Service
+          name: ofd1-forecast
+          port: 80
+---
+apiVersion: externaldns.k8s.io/v1alpha1
+kind: DNSEndpoint
+metadata:
+  name: ofd1-forecast
+  namespace: ofd1-forecast
+spec:
+  endpoints:
+    - dnsName: ofd1.lab.jake-watson.co.uk
+      recordTTL: 300
+      recordType: A
+      targets:
+        - 212.69.47.125

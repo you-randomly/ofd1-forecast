@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+__marimo__/
+.DS_Store
+data/ofd1_thingspeak_raw.parquet
+data/ofd1_aligned_15m.parquet
+data/ofd1_aligned_hourly_2024_2026_backup.parquet
+data/historic_ofd_streamway_cleaned.csv
+data/open_meteo_2015_2023.parquet
+data/phase2_trial_predictions.parquet

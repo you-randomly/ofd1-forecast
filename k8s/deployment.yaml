@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ofd1-forecast
+  namespace: ofd1-forecast
+  labels:
+    app: ofd1-forecast
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ofd1-forecast
+  template:
+    metadata:
+      labels:
+        app: ofd1-forecast
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: app
+          image: ghcr.io/you-randomly/ofd1-forecast:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: TZ
+              value: Europe/London
+            - name: OFD1_DATA_DIR
+              value: "/data"
+            - name: OFD1_SEED_DIR
+              value: "/app/seed_data"
+            - name: OFD1_REFRESH_SECONDS
+              value: "600"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          volumeMounts:
+            - name: telemetry-data
+              mountPath: /data
+      volumes:
+        - name: telemetry-data
+          persistentVolumeClaim:
+            claimName: ofd1-telemetry-pvc
+      restartPolicy: Always
