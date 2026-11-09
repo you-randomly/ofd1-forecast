@@ -1,5 +1,6 @@
 .git
 .github
+.agents
 .venv
 __pycache__
 __marimo__

@@ -6,9 +6,9 @@
     <!-- MANDATORY: Declare support for both light and dark themes to avoid FOUC -->
     <meta name="color-scheme" content="light dark" />
     <title>OFD1 Streamway — Caver Flood Forecast & Telemetry</title>
-    <link rel="stylesheet" href="/static/styles.css?v=3" />
+    <link rel="stylesheet" href="/static/styles.css?v=9" />
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
-    <script src="/static/app.js?v=3" defer></script>
+    <script src="/static/app.js?v=9" defer></script>
   </head>
   <body>
     <div class="page-shell">
@@ -140,8 +140,9 @@
             <div>
               <h2>Streamway Hydrograph: Past 72h Observed &amp; Next 48h Forecast (P10–P90 Band)</h2>
               <p class="panel-subtitle">
-                Shaded band represents the 80% quantile prediction interval (P10 lower bound to P90
-                conservative safety trigger). Red dashed line marks 700 mm (~6&quot; over The Step).
+                Shaded 80% quantile prediction interval couples hydrological quantile regression with
+                the 6-model NWP Super-Ensemble (UKMO 2km, ECMWF IFS, ICON-EU, AROME, GFS) at
+                +12–48h. Red dashed line marks 700 mm (~6&quot; over The Step).
               </p>
             </div>
           </div>
@@ -151,10 +152,10 @@
         <div class="two-col-grid">
           <!-- Telemetry Gauge Status -->
           <section class="panel-card">
-            <h2>Telemetry Logger Health &amp; Failover Status</h2>
+            <h2>Telemetry Logger Health &amp; NWP Ensemble Status</h2>
             <p class="panel-subtitle">
               Real-time synchronization across underground pressure transducer, club tipping-bucket
-              gauges, and radar/NWP reanalysis fallback.
+              gauges, and the 6-model NWP precipitation super-ensemble.
             </p>
             <div id="gauge-status-list" class="gauge-list"></div>
           </section>
@@ -163,8 +164,8 @@
           <section class="panel-card">
             <h2>Key Forecast Checkpoints (+1h to +48h)</h2>
             <p class="panel-subtitle">
-              Use <strong>P90 Upper</strong> for conservative life-safety decisions (95–100% flood
-              onset recall) and <strong>P50 Median</strong> for expected streamway depth.
+              Use <strong>P90 Safety</strong> (hydrological + NWP ensemble upper bound) for
+              life-safety decisions and <strong>P50 Median</strong> for expected streamway depth.
             </p>
             <div
               tabindex="0"
@@ -182,6 +183,7 @@
                     <th scope="col">Time (UTC)</th>
                     <th scope="col">P50 Depth</th>
                     <th scope="col">P90 Safety</th>
+                    <th scope="col">NWP Rain (P50/P90)</th>
                     <th scope="col">Over Step</th>
                     <th scope="col">Status</th>
                   </tr>
@@ -317,6 +319,145 @@
           <div id="verif-hydro-chart" class="chart-box chart-tall"></div>
         </div>
 
+        <!-- Forecast Deviations: Band Coverage & Likely Contributing Factors -->
+        <section class="panel-card">
+          <h2>Forecast Deviations: Band Coverage &amp; Likely Contributing Factors</h2>
+          <p class="panel-subtitle">
+            Examines historical P50 forecast deviations (&ge;20 mm) alongside the model&rsquo;s
+            <strong>P10–P90 probability band</strong>, steep flood-limb timing shifts (&plusmn;1h),
+            and likely contributing factors such as local gauge vs. catchment rainfall differences and
+            archived issue-lead NWP model spread (available from Jan 2024 onward).
+          </p>
+
+          <div class="kpi-grid" id="prob-attr-kpis">
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">Within P10–P90 Band</span>
+                <span class="kpi-tag" id="attr-devs-tag">— deviations &ge;20mm</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="attr-in-band-pct">—%</div>
+                <p class="kpi-meta" id="attr-band-width-note">
+                  Model widened P10–P90 band during high-volatility periods
+                </p>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">Within &plusmn;1h Flood-Wall Timing</span>
+                <span class="kpi-tag">Phase Tolerance</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="attr-1h-pct">—%</div>
+                <p class="kpi-meta" id="attr-1h-note">
+                  Includes steep rising/falling limbs arriving within &plusmn;1 hour
+                </p>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">Outside &plusmn;1h Band</span>
+                <span class="kpi-tag">Gauge / NWP Divergence</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="attr-outside-pct">—%</div>
+                <p class="kpi-meta" id="attr-outside-note">
+                  Likely driven by local gauge vs. grid rain or NWP forecast error
+                </p>
+              </div>
+            </article>
+
+            <article class="kpi-card">
+              <header class="kpi-header">
+                <span class="kpi-title">2026 Ensemble Calibration Backtest</span>
+                <span class="kpi-tag" id="attr-bt-horizon-tag">6-Model NWP</span>
+              </header>
+              <div class="kpi-body">
+                <div class="kpi-primary" id="attr-hist-pop">—% Coverage</div>
+                <p class="kpi-meta" id="attr-hist-spread-note">
+                  Calibrated across 6,693 unseen 2026 issue hours
+                </p>
+              </div>
+            </article>
+          </div>
+
+          <!-- Visual Contributing-Factor & Probability Cone Charts -->
+          <div class="two-col-grid" style="margin-bottom: 1.25rem">
+            <div class="panel-card" style="margin-bottom: 0">
+              <h3 style="margin: 0 0 0.25rem 0; font-size: 1rem">
+                1. Likely Contributing Factors for Deviations (&ge;20 mm)
+              </h3>
+              <p class="panel-subtitle" style="margin-bottom: 0.5rem">
+                Share of forecast deviations associated with wide <strong>P10–P90 bands</strong>,
+                <strong>&plusmn;1h flood-wall timing</strong>, and <strong>gauge vs. catchment rain differences</strong>.
+              </p>
+              <div id="verif-cause-chart" class="chart-box" style="min-height: 300px"></div>
+            </div>
+
+            <div class="panel-card" style="margin-bottom: 0">
+              <h3 style="margin: 0 0 0.25rem 0; font-size: 1rem">
+                2. Probability Capture Cone vs. Realized Error
+              </h3>
+              <p class="panel-subtitle" style="margin-bottom: 0.5rem">
+                Points inside the shaded green cone had <code>|P50 &minus; Actual|</code> covered by the
+                <strong>P10–P90 band</strong>; bubble size reflects <strong>issue-lead 6h NWP model spread (&Delta; mm)</strong>.
+              </p>
+              <div id="verif-prob-scatter-chart" class="chart-box" style="min-height: 300px"></div>
+            </div>
+          </div>
+
+          <div
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              flex-wrap: wrap;
+              gap: 0.5rem;
+              margin-bottom: 0.5rem;
+            "
+          >
+            <span style="font-size: 0.85rem; color: var(--text-secondary)">
+              <strong>Tip:</strong> Click any flood event row below (or marker on the scatter chart) to
+              zoom &amp; spotlight that 48-hour window on the hydrograph above.
+            </span>
+            <button
+              type="button"
+              id="verif-reset-zoom-btn"
+              class="preset-btn"
+              style="display: none; padding: 0.3rem 0.75rem; font-size: 0.8rem"
+            >
+              Reset Hydrograph Zoom
+            </button>
+          </div>
+
+          <div
+            tabindex="0"
+            role="region"
+            aria-labelledby="verif-deviations-caption"
+            class="table-wrapper"
+          >
+            <table class="forecast-table">
+              <caption id="verif-deviations-caption" class="sr-only">
+                Largest historical forecast deviations and likely contributing factors
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Target (UTC)</th>
+                  <th scope="col">Pred P50 vs Actual</th>
+                  <th scope="col">P10–P90 Band (Width)</th>
+                  <th scope="col">Realized Quantile</th>
+                  <th scope="col">Archive PoP &amp; Issue-Lead NWP Spread</th>
+                  <th scope="col">6h Rain (Gauge / Grid)</th>
+                  <th scope="col">Likely Contributing Factor</th>
+                </tr>
+              </thead>
+              <tbody id="verif-deviations-body"></tbody>
+            </table>
+          </div>
+        </section>
+
         <div class="two-col-grid">
           <section class="panel-card">
             <h2>Multi-Horizon Accuracy Comparison (+1h to +24h)</h2>
@@ -373,7 +514,8 @@
                     <th scope="col">P10–P90 Band</th>
                     <th scope="col">Actual</th>
                     <th scope="col">Error</th>
-                    <th scope="col">Band</th>
+                    <th scope="col">Band / Quantile</th>
+                    <th scope="col">Diagnostic Attribution</th>
                   </tr>
                 </thead>
                 <tbody id="verif-audit-body"></tbody>
