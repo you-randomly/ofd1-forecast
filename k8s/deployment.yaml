@@ -16,6 +16,9 @@ spec:
     metadata:
       labels:
         app: ofd1-forecast
+      annotations:
+        app.kubernetes.io/updated: "2026-11-11T13:45:00Z"
+        app.kubernetes.io/version: "v1.1.0-evolution-ledger"
     spec:
       securityContext:
         runAsNonRoot: true

@@ -108,10 +108,17 @@ async def get_diagnostics() -> dict[str, Any]:
 
 @app.get("/api/verification")
 async def get_verification(
-    horizon_h: int = Query(2, description="Forecast lead horizon in hours (1, 2, 3, 6, 12, 24)"),
+    horizon_h: int = Query(2, description="Forecast lead horizon in hours (1, 2, 3, 6, 12, 18, 24, 36, 48)"),
     window: str = Query("oct_2026_floods", description="Evaluation time window"),
 ) -> dict[str, Any]:
-    if horizon_h not in [1, 2, 3, 6, 12, 24]:
+    if horizon_h not in [1, 2, 3, 6, 12, 18, 24, 36, 48]:
         horizon_h = 2
     return engine.get_verification_history(horizon_h=horizon_h, window=window)
+
+
+@app.get("/api/forecast-evolution")
+async def get_forecast_evolution(
+    target_timestamp: str = Query(..., description="Target arrival timestamp in ISO format (e.g. 2026-11-09T16:00:00Z)"),
+) -> dict[str, Any]:
+    return engine.get_forecast_evolution_for_target(target_iso=target_timestamp)
 

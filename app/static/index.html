@@ -6,9 +6,9 @@
     <!-- MANDATORY: Declare support for both light and dark themes to avoid FOUC -->
     <meta name="color-scheme" content="light dark" />
     <title>OFD1 Streamway — Caver Flood Forecast & Telemetry</title>
-    <link rel="stylesheet" href="/static/styles.css?v=9" />
+    <link rel="stylesheet" href="/static/styles.css?v=10" />
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
-    <script src="/static/app.js?v=9" defer></script>
+    <script src="/static/app.js?v=11" defer></script>
   </head>
   <body>
     <div class="page-shell">
@@ -221,7 +221,10 @@
                   <option value="3">+3 Hours Ahead</option>
                   <option value="6">+6 Hours Ahead</option>
                   <option value="12">+12 Hours Ahead</option>
+                  <option value="18">+18 Hours Ahead</option>
                   <option value="24">+24 Hours Ahead</option>
+                  <option value="36">+36 Hours Ahead</option>
+                  <option value="48">+48 Hours Ahead</option>
                 </select>
               </label>
               <label class="select-field">
@@ -248,6 +251,15 @@
                   </option>
                 </select>
               </label>
+              <button
+                type="button"
+                id="open-drilldown-btn"
+                class="preset-btn"
+                style="align-self: flex-end; padding: 0.55rem 0.9rem; font-size: 0.82rem; height: 38px;"
+                title="Inspect how forecasts issued at 48h down to 1h lead converged onto any target moment"
+              >
+                🎯 Inspect Multi-Lead Evolution
+              </button>
             </div>
           </div>
 
@@ -405,6 +417,97 @@
                 <strong>P10–P90 band</strong>; bubble size reflects <strong>issue-lead 6h NWP model spread (&Delta; mm)</strong>.
               </p>
               <div id="verif-prob-scatter-chart" class="chart-box" style="min-height: 300px"></div>
+            </div>
+          </div>
+
+          <!-- Interactive Target Timestamp Drilldown (Forecast Evolution by Lead Time) -->
+          <div
+            id="target-drilldown-box"
+            class="panel-card"
+            style="
+              display: none;
+              margin-bottom: 1.25rem;
+              border: 1px solid var(--accent);
+              background: var(--bg-surface);
+            "
+          >
+            <div
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 0.5rem;
+                margin-bottom: 0.75rem;
+              "
+            >
+              <div>
+                <h3 style="margin: 0; font-size: 1.05rem">
+                  🎯 Forecast Evolution by Lead Time: <span id="drilldown-target-label" style="color: var(--accent)">—</span>
+                </h3>
+                <p class="panel-subtitle" style="margin-top: 0.2rem">
+                  Shows how forecasts issued at <strong>+48h, +36h, +24h, +18h, +12h, +6h, +3h, +2h, and +1h</strong> converged onto this target moment based on data available at each issue time.
+                </p>
+              </div>
+              <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+                <label for="drilldown-custom-ts" style="font-size: 0.82rem; color: var(--text-secondary); margin: 0;">
+                  Target Moment (UTC):
+                </label>
+                <input
+                  type="datetime-local"
+                  id="drilldown-custom-ts"
+                  aria-label="Target Moment UTC for Multi-Lead Forecast Evolution"
+                  style="font-size: 0.82rem; padding: 0.35rem 0.6rem; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-primary);"
+                />
+                <button
+                  type="button"
+                  id="drilldown-go-btn"
+                  class="preset-btn"
+                  style="padding: 0.35rem 0.8rem; font-size: 0.82rem;"
+                >
+                  Analyze
+                </button>
+                <button
+                  type="button"
+                  id="drilldown-close-btn"
+                  class="preset-btn"
+                  style="padding: 0.35rem 0.8rem; font-size: 0.82rem"
+                >
+                  ✕ Close Inspector
+                </button>
+              </div>
+            </div>
+
+            <div
+              tabindex="0"
+              role="region"
+              aria-labelledby="drilldown-table-caption"
+              class="table-wrapper"
+            >
+              <table class="forecast-table">
+                <caption id="drilldown-table-caption" class="sr-only">
+                  Multi-lead forecast evolution for selected target timestamp
+                </caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Lead Horizon</th>
+                    <th scope="col">Forecast Issued At (UTC)</th>
+                    <th scope="col">Start Depth at Issue</th>
+                    <th scope="col">Predicted P50</th>
+                    <th scope="col">P10–P90 Uncertainty Band</th>
+                    <th scope="col">Actual Measured Depth</th>
+                    <th scope="col">Error (P50 − Act)</th>
+                    <th scope="col">Band Status</th>
+                  </tr>
+                </thead>
+                <tbody id="drilldown-table-body">
+                  <tr>
+                    <td colspan="8" style="text-align: center; color: var(--text-secondary)">
+                      Click any point on the hydrograph or row in the deviations table to view evolution…
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
           </div>
 

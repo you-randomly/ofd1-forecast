@@ -1300,15 +1300,18 @@ class OFD1ForecastEngine:
 
     def _ensure_and_update_verification_ledger(self, df_feat: pd.DataFrame) -> None:
         """Seed full 2015-2026 verification ledger (tagged train vs out-of-sample test), append live forecasts, and reconcile actual depths."""
-        ledger_horizons = [1, 2, 3, 6, 12, 24]
+        ledger_horizons = [1, 2, 3, 6, 12, 18, 24, 36, 48]
         valid_obs = df_feat.dropna(subset=["depth_mm"]).sort_index()
 
         need_seed = not self.ledger_path.exists()
         if not need_seed:
             _existing = pd.read_parquet(self.ledger_path)
+            existing_h = set(_existing["horizon_h"].unique())
             if "train_in_sample" not in _existing["source"].unique():
                 need_seed = True
             elif pd.to_datetime(_existing["target_timestamp"].min(), utc=True) > valid_obs.index.min() + pd.Timedelta(days=30):
+                need_seed = True
+            elif not set(ledger_horizons).issubset(existing_h):
                 need_seed = True
 
         if need_seed:
@@ -1361,6 +1364,65 @@ class OFD1ForecastEngine:
             df_ledger = pd.concat(ledger_chunks, ignore_index=True)
         else:
             df_ledger = pd.read_parquet(self.ledger_path)
+            df_ledger["target_timestamp"] = pd.to_datetime(df_ledger["target_timestamp"], utc=True)
+            df_ledger["issued_at"] = pd.to_datetime(df_ledger["issued_at"], utc=True)
+
+            # Catch up any gap hours between last recorded issued_at and current anchor
+            if self.latest_payload and "current" in self.latest_payload:
+                now_str = self.latest_payload["current"]["timestamp"]
+                now_ts = pd.to_datetime(now_str, utc=True)
+                max_logged_issued = df_ledger["issued_at"].max()
+
+                gap_hours = valid_obs.loc[
+                    (valid_obs.index > max_logged_issued) & (valid_obs.index < now_ts)
+                ].index
+
+                if len(gap_hours) > 0:
+                    logger.info(
+                        "Catching up verification ledger for %d missed hourly timestamps...",
+                        len(gap_hours),
+                    )
+                    catchup_chunks = []
+                    for h in ledger_horizons:
+                        work_h = self._attach_horizon_future_cols(df_feat, h)
+                        f_cols = CAUSAL_COLS + nwp_cols_for_horizon(h)
+                        sub_gap = work_h.loc[
+                            work_h.index.isin(gap_hours)
+                        ].dropna(subset=["depth_mm", "ddepth_1h", "ddepth_24h"] + f_cols).copy()
+                        if sub_gap.empty:
+                            continue
+
+                        X_sub = sub_gap[f_cols]
+                        base_d = sub_gap["depth_mm"].values
+                        d10 = self.models[h]["p10"].predict(X_sub)
+                        d50 = self.models[h]["p50"].predict(X_sub)
+                        d90 = self.models[h]["p90"].predict(X_sub)
+
+                        p50 = np.maximum(350.0, base_d + d50)
+                        p10 = np.maximum(350.0, base_d + np.minimum(d10, d50))
+                        p90 = np.maximum(p50, base_d + np.maximum(d90, d50))
+
+                        issued_idx = sub_gap.index
+                        target_idx = issued_idx + pd.Timedelta(hours=h)
+                        chunk = pd.DataFrame(
+                            {
+                                "issued_at": issued_idx,
+                                "target_timestamp": target_idx,
+                                "horizon_h": h,
+                                "start_depth_mm": np.round(base_d, 1),
+                                "pred_p10_mm": np.round(p10, 1),
+                                "pred_p50_mm": np.round(p50, 1),
+                                "pred_p90_mm": np.round(p90, 1),
+                                "actual_depth_mm": np.nan,
+                                "rain_mm": np.nan,
+                                "source": "live_forecast",
+                            }
+                        )
+                        catchup_chunks.append(chunk)
+
+                    if catchup_chunks:
+                        df_catchup = pd.concat(catchup_chunks, ignore_index=True)
+                        df_ledger = pd.concat([df_ledger, df_catchup], ignore_index=True)
 
         # Append current live forecast points from self.latest_payload
         if self.latest_payload and "forecast_anchors" in self.latest_payload:
@@ -1524,7 +1586,7 @@ class OFD1ForecastEngine:
 
         # Compute summary scorecard across all horizons for the selected window
         horizon_scorecard = []
-        for h_iter in [1, 2, 3, 6, 12, 24]:
+        for h_iter in [1, 2, 3, 6, 12, 18, 24, 36, 48]:
             sub_h = df_ledger[
                 (df_ledger["horizon_h"] == h_iter)
                 & (df_ledger["target_timestamp"] >= start_ts)
@@ -2054,4 +2116,73 @@ class OFD1ForecastEngine:
         }
         self._verification_cache[cache_key] = result
         return result
+
+    def get_forecast_evolution_for_target(self, target_iso: str) -> dict[str, Any]:
+        """Return the multi-lead forecast evolution (from +48h down to +1h lead) targeting a specific timestamp."""
+        try:
+            target_ts = pd.to_datetime(target_iso, utc=True).round("1h")
+        except Exception as exc:
+            return {"error": f"Invalid target timestamp: {exc}", "target_timestamp": target_iso, "leads": []}
+
+        if not self.ledger_path.exists():
+            df_feat = (
+                self.df_feat_cached
+                if not self.df_feat_cached.empty
+                else self._engineer_features(self.df_hourly)
+            )
+            self._ensure_and_update_verification_ledger(df_feat)
+
+        df_ledger = pd.read_parquet(self.ledger_path)
+        df_ledger["target_timestamp"] = pd.to_datetime(df_ledger["target_timestamp"], utc=True)
+        df_ledger["issued_at"] = pd.to_datetime(df_ledger["issued_at"], utc=True)
+
+        matched = df_ledger[df_ledger["target_timestamp"] == target_ts].sort_values("horizon_h")
+        if matched.empty:
+            # Check if there is an observation near target_ts
+            valid_obs = self.df_hourly.dropna(subset=["depth_mm"]).sort_index()
+            act_val = float(valid_obs.loc[target_ts, "depth_mm"]) if target_ts in valid_obs.index else None
+            return {
+                "target_timestamp": target_ts.strftime("%Y-%m-%d %H:%M UTC"),
+                "actual_depth_mm": act_val,
+                "leads": [],
+            }
+
+        act_val = (
+            float(matched["actual_depth_mm"].dropna().iloc[0])
+            if matched["actual_depth_mm"].notna().any()
+            else None
+        )
+        if act_val is None and target_ts in self.df_hourly.index:
+            obs_depth = self.df_hourly.loc[target_ts, "depth_mm"]
+            if pd.notna(obs_depth):
+                act_val = round(float(obs_depth), 1)
+
+        leads = []
+        for _, r in matched.iterrows():
+            p50 = float(r["pred_p50_mm"])
+            p10 = float(r["pred_p10_mm"])
+            p90 = float(r["pred_p90_mm"])
+            err_v = round(p50 - act_val, 1) if act_val is not None else None
+            in_b = bool(p10 <= act_val <= p90) if act_val is not None else None
+            leads.append(
+                {
+                    "horizon_h": int(r["horizon_h"]),
+                    "issued_at": r["issued_at"].strftime("%Y-%m-%d %H:%M UTC"),
+                    "start_depth_mm": float(r["start_depth_mm"]),
+                    "pred_p10_mm": p10,
+                    "pred_p50_mm": p50,
+                    "pred_p90_mm": p90,
+                    "band_width_mm": round(p90 - p10, 1),
+                    "actual_depth_mm": act_val,
+                    "error_mm": err_v,
+                    "in_band": in_b,
+                    "source": str(r.get("source", "ledger")),
+                }
+            )
+
+        return {
+            "target_timestamp": target_ts.strftime("%Y-%m-%d %H:%M UTC"),
+            "actual_depth_mm": act_val,
+            "leads": leads,
+        }
 

@@ -716,6 +716,85 @@ function renderVerification(verif) {
     };
   }
 
+  // Interactive Target Timestamp Drilldown (Forecast Evolution Inspector)
+  async function inspectTargetForecastEvolution(targetIso) {
+    if (!targetIso) return;
+    const box = document.getElementById("target-drilldown-box");
+    const label = document.getElementById("drilldown-target-label");
+    const tbody = document.getElementById("drilldown-table-body");
+    const closeBtn = document.getElementById("drilldown-close-btn");
+    const inputTs = document.getElementById("drilldown-custom-ts");
+
+    if (inputTs) {
+      try {
+        const d = new Date(targetIso);
+        if (!Number.isNaN(d.getTime())) {
+          const pad = (n) => String(n).padStart(2, "0");
+          inputTs.value = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+        }
+      } catch (_) {}
+    }
+
+    if (closeBtn) {
+      closeBtn.onclick = () => {
+        if (box) box.style.display = "none";
+      };
+    }
+
+    if (box) box.style.display = "block";
+    if (label) label.textContent = `${targetIso.replace("T", " ").slice(0, 16)} UTC (Loading…)`;
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; padding:1.25rem;">Fetching multi-lead forecast evolution for ${targetIso}…</td></tr>`;
+    }
+
+    try {
+      const resp = await fetch(`/api/forecast-evolution?target_timestamp=${encodeURIComponent(targetIso)}`);
+      const data = await resp.json();
+      if (label) {
+        const actStr = data.actual_depth_mm !== null && data.actual_depth_mm !== undefined
+          ? ` • Actual Depth: ${data.actual_depth_mm} mm`
+          : "";
+        label.textContent = `${data.target_timestamp || targetIso}${actStr}`;
+      }
+
+      if (!data.leads || data.leads.length === 0) {
+        if (tbody) {
+          tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--text-secondary); padding:1.25rem;">No stored forecast leads targeting this moment. (Forecasts are logged at hourly and sub-hourly intervals).</td></tr>`;
+        }
+        return;
+      }
+
+      if (tbody) {
+        tbody.innerHTML = "";
+        for (const l of data.leads) {
+          const signE = l.error_mm !== null && l.error_mm >= 0 ? "+" : "";
+          const errStr = l.error_mm !== null ? `${signE}${l.error_mm} mm` : "—";
+          const actStr = l.actual_depth_mm !== null ? `${l.actual_depth_mm} mm` : "Awaiting actual";
+          const chipClass = l.in_band ? "chip-online" : l.error_mm !== null ? "chip-danger" : "chip-warn";
+          const chipLabel = l.in_band ? "IN BAND" : l.error_mm !== null ? "OUTSIDE" : "PENDING";
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <th scope="row"><strong>+${l.horizon_h}h Lead</strong></th>
+            <td>${l.issued_at}</td>
+            <td>${l.start_depth_mm} mm</td>
+            <td><strong>${l.pred_p50_mm} mm</strong></td>
+            <td>${l.pred_p10_mm}–${l.pred_p90_mm} mm <small style="color:var(--text-secondary)">(±${Math.round(l.band_width_mm / 2)} mm)</small></td>
+            <td><strong>${actStr}</strong></td>
+            <td>${errStr}</td>
+            <td><span class="status-chip ${chipClass}">${chipLabel}</span></td>
+          `;
+          tbody.appendChild(tr);
+        }
+      }
+
+      if (box) box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (err) {
+      if (tbody) {
+        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--accent-red); padding:1rem;">Failed to load forecast evolution: ${err}</td></tr>`;
+      }
+    }
+  }
+
   function spotlightVerificationEvent(targetIso) {
     if (!targetIso) return;
     const tMs = new Date(targetIso).getTime();
@@ -728,6 +807,21 @@ function renderVerification(verif) {
     if (resetZoomBtn) resetZoomBtn.style.display = "inline-flex";
     const chartEl = document.getElementById("verif-hydro-chart");
     if (chartEl) chartEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    inspectTargetForecastEvolution(targetIso);
+  }
+
+  const verifChartEl = document.getElementById("verif-hydro-chart");
+  if (verifChartEl && typeof verifChartEl.removeAllListeners === "function") {
+    verifChartEl.removeAllListeners("plotly_click");
+  }
+  if (verifChartEl && typeof verifChartEl.on === "function") {
+    verifChartEl.on("plotly_click", (ev) => {
+      const pt = ev?.points?.[0];
+      if (pt && pt.x) {
+        const targetIso = typeof pt.x === "string" ? pt.x : new Date(pt.x).toISOString();
+        inspectTargetForecastEvolution(targetIso);
+      }
+    });
   }
 
   // Multi-Horizon Scorecard Table
@@ -1002,6 +1096,42 @@ function renderVerification(verif) {
 ["verif-horizon", "verif-window"].forEach((id) => {
   document.getElementById(id).addEventListener("change", loadVerification);
 });
+
+const openDrilldownBtn = document.getElementById("open-drilldown-btn");
+if (openDrilldownBtn) {
+  openDrilldownBtn.addEventListener("click", () => {
+    const box = document.getElementById("target-drilldown-box");
+    const inputTs = document.getElementById("drilldown-custom-ts");
+    if (box) box.style.display = "block";
+    let targetIso = "";
+    if (inputTs && inputTs.value) {
+      targetIso = new Date(inputTs.value + (inputTs.value.endsWith("Z") ? "" : "Z")).toISOString();
+    } else {
+      // Default to 2 days ago at 16:00 UTC
+      const d = new Date();
+      d.setUTCDate(d.getUTCDate() - 2);
+      d.setUTCHours(16, 0, 0, 0);
+      targetIso = d.toISOString();
+    }
+    // Spotlight and inspect
+    if (typeof inspectTargetForecastEvolution === "function") {
+      inspectTargetForecastEvolution(targetIso);
+    }
+  });
+}
+
+const drilldownGoBtn = document.getElementById("drilldown-go-btn");
+if (drilldownGoBtn) {
+  drilldownGoBtn.addEventListener("click", () => {
+    const inputTs = document.getElementById("drilldown-custom-ts");
+    if (inputTs && inputTs.value) {
+      const targetIso = new Date(inputTs.value + (inputTs.value.endsWith("Z") ? "" : "Z")).toISOString();
+      if (typeof inspectTargetForecastEvolution === "function") {
+        inspectTargetForecastEvolution(targetIso);
+      }
+    }
+  });
+}
 
 // Simulator logic
 async function runSimulation() {
