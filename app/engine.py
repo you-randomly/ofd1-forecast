@@ -19,6 +19,8 @@ HORIZONS = [1, 2, 3, 6, 12, 18, 24, 36, 48]
 STEP_DATUM_MM = 550.0
 AMBER_DEPTH_MM = 620.0
 RED_DEPTH_MM = 700.0  # ~6 inches over The Step
+RED_TRIGGER_DEPTH_MM = 705.0  # Rising limb trigger threshold (prevents edge-touching false alarms)
+RED_CLEAR_DEPTH_MM = 675.0  # Falling limb clearance threshold (hysteresis deadband)
 TRAIN_SPLIT_UTC = pd.Timestamp("2026-01-01 00:00:00+00:00")
 
 CAUSAL_COLS = (
@@ -291,6 +293,61 @@ class OFD1ForecastEngine:
         for k in range(0, min(h, 6)):
             work[f"fut_rain_minus_{k}h_from_target"] = work["rain_mm"].shift(-(h - k))
         return work
+
+    @staticmethod
+    def _apply_hydrological_guardrails(
+        base_depth: np.ndarray | float,
+        ddepth_1h: np.ndarray | float,
+        fused_rain_3h: np.ndarray | float,
+        moisture_index: np.ndarray | float,
+        tank_168h: np.ndarray | float,
+        horizon_h: int,
+        fut_rain_sum: np.ndarray | float,
+        d_p10: np.ndarray | float,
+        d_p50: np.ndarray | float,
+        d_p90: np.ndarray | float,
+    ) -> tuple[np.ndarray | float, np.ndarray | float, np.ndarray | float]:
+        """Apply physical karst rate-of-rise and peat sponge infiltration guardrails.
+
+        Prevents unphysical flood pulses when antecedent peat moisture and available rainfall
+        cannot physically generate the water volume needed to submerge The Step (>= 700 mm).
+        """
+        is_scalar = np.isscalar(base_depth) or isinstance(base_depth, float)
+        b_d = np.asarray(base_depth, dtype=float)
+        dd1 = np.asarray(ddepth_1h, dtype=float)
+        r3h = np.maximum(0.0, np.asarray(fused_rain_3h, dtype=float))
+        rfut = np.maximum(0.0, np.asarray(fut_rain_sum, dtype=float))
+        m_idx = np.asarray(moisture_index, dtype=float)
+        t168 = np.asarray(tank_168h, dtype=float)
+        dp10 = np.asarray(d_p10, dtype=float)
+        dp50 = np.asarray(d_p50, dtype=float)
+        dp90 = np.asarray(d_p90, dtype=float)
+
+        rain_avail = r3h + rfut
+        sat_factor = np.clip(m_idx ** 1.5, 0.15, 1.0)
+
+        # Peat sponge absorption deduction: when 7-day tank is dry (< 0.5), initial ~8mm rain is retained
+        sponge_deduct = np.where(t168 < 0.5, 8.0, 0.0)
+        eff_rain = np.maximum(0.0, rain_avail - sponge_deduct) * sat_factor
+
+        # Maximum physical rise for OFD1 karst:
+        # 25mm baseflow buffer + 12mm rise per 1mm effective rain
+        max_phys_rise = 25.0 + 12.0 * eff_rain
+
+        # Slew rate limit: max 30-35 mm/h for lead times <= 6h unless rain is heavy
+        max_rate_rise = np.where(eff_rain < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
+        allowed_rise = np.minimum(max_phys_rise, max_rate_rise)
+
+        # Apply clamp only when base depth is below Amber (< 620 mm) and not already surging (ddepth_1h < 15 mm)
+        clamp_mask = (b_d < 620.0) & (dd1 < 15.0)
+
+        clamped_p50 = np.where(clamp_mask, np.minimum(dp50, allowed_rise), dp50)
+        clamped_p90 = np.where(clamp_mask, np.minimum(dp90, allowed_rise * 1.5 + 20.0), dp90)
+        clamped_p10 = np.where(clamp_mask, np.minimum(dp10, clamped_p50), dp10)
+
+        if is_scalar:
+            return float(clamped_p10), float(clamped_p50), float(clamped_p90)
+        return clamped_p10, clamped_p50, clamped_p90
 
     def _train_and_save_models(self, df_feat: pd.DataFrame) -> None:
         logger.info(
@@ -646,14 +703,27 @@ class OFD1ForecastEngine:
             )
             ens_min = np.nanpercentile(mat, 10, axis=0)
             ens_med = np.nanpercentile(mat, 50, axis=0)
-            ens_max = np.nanpercentile(mat, 90, axis=0)
+            raw_ens_max = np.nanpercentile(mat, 90, axis=0)
+
+            # Consensus Quorum: require >= 2 models predicting rain (>= 0.6 mm/h) before allowing outlier expansion
+            wet_members_count = np.sum(mat >= 0.6, axis=0)
+            ens_max = np.where(
+                wet_members_count >= 2,
+                raw_ens_max,
+                np.minimum(raw_ens_max, 0.5 * (ens_med + raw_ens_max)),
+            )
 
             rain_p50 = np.round(0.5 * det_rain + 0.5 * ens_med, 2)
             rain_p10 = np.round(np.minimum(rain_p50, ens_min), 2)
 
             # Conserve 48h ensemble storm volume so timing jitter across models does not inflate total volume beyond member P90
             member_totals_48h = np.nansum(mat[:, :48], axis=1)
-            target_p90_total = float(np.nanpercentile(member_totals_48h, 90))
+            high_vol_members = int(np.sum(member_totals_48h >= 10.0))
+            if high_vol_members >= 2:
+                target_p90_total = float(np.nanpercentile(member_totals_48h, 90))
+            else:
+                target_p90_total = float(np.nanpercentile(member_totals_48h, 75))
+
             raw_p90 = np.maximum(rain_p50, ens_max)
             raw_p90_sum = float(np.sum(raw_p90[:48]))
             if raw_p90_sum > 1e-3 and target_p90_total > 0.0:
@@ -831,10 +901,36 @@ class OFD1ForecastEngine:
             delta_nwp_high = max(0.0, d_p50_on_p90 - d_p50, 0.35 * (d_p90_ens - d_p90_det))
             total_high_spread = float(np.sqrt(delta_hydro_high**2 + delta_nwp_high**2))
 
-            p50 = max(350.0, base_depth + d_p50)
-            p10 = max(350.0, min(p50, p50 - total_low_spread, base_depth + min(d_p10_det, d_p50)))
-            p90_hydro_only = max(p50, base_depth + d_p50 + delta_hydro_high)
-            p90 = max(p90_hydro_only, p50 + total_high_spread)
+            # Apply physical karst rate-of-rise and peat sponge infiltration guardrails
+            fused_3h = float(now_row.get("fused_rain_sum_3h", 0.0))
+            fut_sum = (
+                float(x_row_p50["fut_rain_sum_6h_at_target"].iloc[0])
+                if "fut_rain_sum_6h_at_target" in x_row_p50
+                else 0.0
+            )
+            moist_idx = float(now_row.get("moisture_index", 0.5))
+            t_168 = float(now_row.get("tank_168h", 0.5))
+            dd_1h = float(now_row.get("ddepth_1h", 0.0))
+
+            d_p10_c, d_p50_c, d_p90_c = self._apply_hydrological_guardrails(
+                base_depth=base_depth,
+                ddepth_1h=dd_1h,
+                fused_rain_3h=fused_3h,
+                moisture_index=moist_idx,
+                tank_168h=t_168,
+                horizon_h=h,
+                fut_rain_sum=fut_sum,
+                d_p10=-total_low_spread,
+                d_p50=d_p50,
+                d_p90=d_p50 + total_high_spread,
+            )
+
+            p50 = max(350.0, base_depth + d_p50_c)
+            p10 = max(350.0, min(p50, p50 + d_p10_c))
+            p90_hydro_only = max(
+                p50, min(base_depth + d_p90_c, base_depth + d_p50_c + delta_hydro_high)
+            )
+            p90 = max(p50, base_depth + d_p90_c)
 
             target_ts = now_ts + pd.Timedelta(hours=h)
             fut_rain = (
@@ -943,11 +1039,38 @@ class OFD1ForecastEngine:
             p90_v = round(float(df_interp.loc[h_step, "p90_mm"]), 1)
             p90_hydro_v = round(float(df_interp.loc[h_step, "p90_hydro_only_mm"]), 1)
             p10_v = round(float(df_interp.loc[h_step, "p10_mm"]), 1)
-            status = (
-                "RED"
-                if p50_v >= RED_DEPTH_MM
-                else ("AMBER" if p90_v >= RED_DEPTH_MM or p50_v >= AMBER_DEPTH_MM else "GREEN")
+            # Persistence debounce with hysteresis deadband:
+            # - Rising limb requires >= RED_TRIGGER_DEPTH_MM (705 mm) with persistence to avoid edge-touching chatter
+            # - Recession limb remains RED until falling below RED_CLEAR_DEPTH_MM (675 mm)
+            # - Transitional depths (675-705 mm) without multi-hour persistence are held at AMBER
+            is_over_trigger = p50_v >= RED_TRIGGER_DEPTH_MM
+            has_persist = False
+            if is_over_trigger:
+                if base_depth >= AMBER_DEPTH_MM:
+                    has_persist = True
+                else:
+                    prev_p50 = float(df_interp.loc[h_step - 1, "p50_mm"]) if h_step > 1 else base_depth
+                    next_p50 = float(df_interp.loc[h_step + 1, "p50_mm"]) if h_step < 48 else p50_v
+                    has_persist = (prev_p50 >= RED_DEPTH_MM) or (next_p50 >= RED_DEPTH_MM)
+
+            prev_status = (
+                forecast_hourly[-1]["status"]
+                if forecast_hourly
+                else ("RED" if base_depth >= RED_DEPTH_MM else "GREEN")
             )
+            is_recession_red = (prev_status == "RED") and (p50_v >= RED_CLEAR_DEPTH_MM)
+
+            if (is_over_trigger and has_persist) or is_recession_red:
+                status = "RED"
+            elif (
+                p90_v >= RED_DEPTH_MM
+                or p50_v >= AMBER_DEPTH_MM
+                or is_over_trigger
+                or p50_v >= RED_CLEAR_DEPTH_MM
+            ):
+                status = "AMBER"
+            else:
+                status = "GREEN"
             forecast_hourly.append(
                 {
                     "horizon_h": h_step,
@@ -998,13 +1121,17 @@ class OFD1ForecastEngine:
         max_p50_24h = max(p["p50_mm"] for p in forecast_hourly[:24])
         max_p90_24h = max(p["p90_mm"] for p in forecast_hourly[:24])
 
-        if base_depth >= RED_DEPTH_MM or max_p50_6h >= RED_DEPTH_MM:
+        red_hours_6h = [p["status"] == "RED" for p in forecast_hourly[:6]]
+        has_red_6h = any(red_hours_6h)
+
+        if base_depth >= RED_DEPTH_MM or has_red_6h:
             overall_alert = "RED"
             alert_headline = "FLOOD PULSE ACTIVE OR IMMINENT (≥700 mm / >6\" over The Step)"
         elif (
             base_depth >= AMBER_DEPTH_MM
             or max_p90_12h >= RED_DEPTH_MM
             or max_p50_24h >= RED_DEPTH_MM
+            or max_p50_6h >= RED_DEPTH_MM
         ):
             overall_alert = "AMBER"
             alert_headline = "CAUTION: ELEVATED WATER OR RISING FLOOD RISK IN NEXT 12–24H"
@@ -1335,9 +1462,40 @@ class OFD1ForecastEngine:
                 d50 = self.models[h]["p50"].predict(X_sub)
                 d90 = self.models[h]["p90"].predict(X_sub)
 
-                p50 = np.maximum(350.0, base_d + d50)
-                p10 = np.maximum(350.0, base_d + np.minimum(d10, d50))
-                p90 = np.maximum(p50, base_d + np.maximum(d90, d50))
+                fused_3h = (
+                    sub["fused_rain_sum_3h"].values
+                    if "fused_rain_sum_3h" in sub
+                    else np.zeros(len(sub))
+                )
+                fut_sum = (
+                    sub["fut_rain_sum_6h_at_target"].values
+                    if "fut_rain_sum_6h_at_target" in sub
+                    else np.zeros(len(sub))
+                )
+                moist_idx = (
+                    sub["moisture_index"].values
+                    if "moisture_index" in sub
+                    else np.full(len(sub), 0.5)
+                )
+                t_168 = sub["tank_168h"].values if "tank_168h" in sub else np.full(len(sub), 0.5)
+                dd_1h = sub["ddepth_1h"].values if "ddepth_1h" in sub else np.zeros(len(sub))
+
+                d10_c, d50_c, d90_c = self._apply_hydrological_guardrails(
+                    base_depth=base_d,
+                    ddepth_1h=dd_1h,
+                    fused_rain_3h=fused_3h,
+                    moisture_index=moist_idx,
+                    tank_168h=t_168,
+                    horizon_h=h,
+                    fut_rain_sum=fut_sum,
+                    d_p10=d10,
+                    d_p50=d50,
+                    d_p90=d90,
+                )
+
+                p50 = np.maximum(350.0, base_d + d50_c)
+                p10 = np.maximum(350.0, base_d + np.minimum(d10_c, d50_c))
+                p90 = np.maximum(p50, base_d + np.maximum(d90_c, d50_c))
 
                 issued_idx = sub.index
                 target_idx = issued_idx + pd.Timedelta(hours=h)
@@ -1398,9 +1556,48 @@ class OFD1ForecastEngine:
                         d50 = self.models[h]["p50"].predict(X_sub)
                         d90 = self.models[h]["p90"].predict(X_sub)
 
-                        p50 = np.maximum(350.0, base_d + d50)
-                        p10 = np.maximum(350.0, base_d + np.minimum(d10, d50))
-                        p90 = np.maximum(p50, base_d + np.maximum(d90, d50))
+                        fused_3h = (
+                            sub_gap["fused_rain_sum_3h"].values
+                            if "fused_rain_sum_3h" in sub_gap
+                            else np.zeros(len(sub_gap))
+                        )
+                        fut_sum = (
+                            sub_gap["fut_rain_sum_6h_at_target"].values
+                            if "fut_rain_sum_6h_at_target" in sub_gap
+                            else np.zeros(len(sub_gap))
+                        )
+                        moist_idx = (
+                            sub_gap["moisture_index"].values
+                            if "moisture_index" in sub_gap
+                            else np.full(len(sub_gap), 0.5)
+                        )
+                        t_168 = (
+                            sub_gap["tank_168h"].values
+                            if "tank_168h" in sub_gap
+                            else np.full(len(sub_gap), 0.5)
+                        )
+                        dd_1h = (
+                            sub_gap["ddepth_1h"].values
+                            if "ddepth_1h" in sub_gap
+                            else np.zeros(len(sub_gap))
+                        )
+
+                        d10_c, d50_c, d90_c = self._apply_hydrological_guardrails(
+                            base_depth=base_d,
+                            ddepth_1h=dd_1h,
+                            fused_rain_3h=fused_3h,
+                            moisture_index=moist_idx,
+                            tank_168h=t_168,
+                            horizon_h=h,
+                            fut_rain_sum=fut_sum,
+                            d_p10=d10,
+                            d_p50=d50,
+                            d_p90=d90,
+                        )
+
+                        p50 = np.maximum(350.0, base_d + d50_c)
+                        p10 = np.maximum(350.0, base_d + np.minimum(d10_c, d50_c))
+                        p90 = np.maximum(p50, base_d + np.maximum(d90_c, d50_c))
 
                         issued_idx = sub_gap.index
                         target_idx = issued_idx + pd.Timedelta(hours=h)

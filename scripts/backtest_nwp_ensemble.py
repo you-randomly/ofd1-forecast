@@ -91,13 +91,25 @@ def _build_future_rain_trajectories(
 
     ens_min = np.percentile(stack_filled, 10, axis=0)
     ens_med = np.percentile(stack_filled, 50, axis=0)
-    ens_max = np.percentile(stack_filled, 90, axis=0)
+    raw_ens_max = np.percentile(stack_filled, 90, axis=0)
+
+    # 2-model consensus quorum: require >= 2 members predicting rain >= 0.6 mm/h
+    wet_members_count = np.sum(stack_filled >= 0.6, axis=0)
+    ens_max = np.where(
+        wet_members_count >= 2,
+        raw_ens_max,
+        np.minimum(raw_ens_max, 0.5 * (ens_med + raw_ens_max)),
+    )
 
     rain_p50 = np.round(0.5 * det_rain + 0.5 * ens_med, 2)
     rain_p10 = np.round(np.minimum(rain_p50, ens_min), 2)
 
     member_totals_48h = np.sum(stack_filled, axis=2)  # (M, N)
-    target_p90_total = np.percentile(member_totals_48h, 90, axis=0)  # (N,)
+    high_vol_count = np.sum(member_totals_48h >= 10.0, axis=0)  # (N,)
+    target_p90_raw = np.percentile(member_totals_48h, 90, axis=0)  # (N,)
+    target_p75_raw = np.percentile(member_totals_48h, 75, axis=0)  # (N,)
+    target_p90_total = np.where(high_vol_count >= 2, target_p90_raw, target_p75_raw)
+
     raw_p90 = np.maximum(rain_p50, ens_max)
     raw_p90_sum = np.sum(raw_p90, axis=1)  # (N,)
 
@@ -269,13 +281,48 @@ def main() -> None:
         )
         total_high = np.sqrt(delta_hydro_high**2 + delta_nwp_high**2)
 
-        p50_ens = np.maximum(350.0, base_d + d_p50)
-        p10_ens = np.maximum(
-            350.0,
-            np.minimum(p50_ens, np.minimum(p50_ens - total_low, base_d + np.minimum(d_p10_on_p10, d_p50))),
+        fused_3h = (
+            valid_obs.loc[issue_idx, "fused_rain_sum_3h"].values
+            if "fused_rain_sum_3h" in valid_obs.columns
+            else np.zeros(len(issue_idx))
         )
-        p90_hydro = np.maximum(p50_ens, base_d + d_p50 + delta_hydro_high)
-        p90_ens = np.maximum(p90_hydro, p50_ens + total_high)
+        fut_sum = (
+            X_p50["fut_rain_sum_6h_at_target"].values
+            if "fut_rain_sum_6h_at_target" in X_p50.columns
+            else np.zeros(len(issue_idx))
+        )
+        moist_idx = (
+            valid_obs.loc[issue_idx, "moisture_index"].values
+            if "moisture_index" in valid_obs.columns
+            else np.full(len(issue_idx), 0.5)
+        )
+        t_168 = (
+            valid_obs.loc[issue_idx, "tank_168h"].values
+            if "tank_168h" in valid_obs.columns
+            else np.full(len(issue_idx), 0.5)
+        )
+        dd_1h = (
+            valid_obs.loc[issue_idx, "ddepth_1h"].values
+            if "ddepth_1h" in valid_obs.columns
+            else np.zeros(len(issue_idx))
+        )
+
+        d10_c, d50_c, d90_c = eng._apply_hydrological_guardrails(
+            base_depth=base_d,
+            ddepth_1h=dd_1h,
+            fused_rain_3h=fused_3h,
+            moisture_index=moist_idx,
+            tank_168h=t_168,
+            horizon_h=h,
+            fut_rain_sum=fut_sum,
+            d_p10=-total_low,
+            d_p50=d_p50,
+            d_p90=d_p50 + total_high,
+        )
+
+        p50_ens = np.maximum(350.0, base_d + d50_c)
+        p10_ens = np.maximum(350.0, base_d + np.minimum(d10_c, d50_c))
+        p90_ens = np.maximum(p50_ens, base_d + d90_c)
 
         # 3. Perfect Wx reference
         d50_pf = m["p50"].predict(X_perf)
