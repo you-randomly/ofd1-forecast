@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,7 +34,7 @@ async def _periodic_sync_loop() -> None:
     while True:
         try:
             await engine.refresh_live_telemetry()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Periodic telemetry sync error: %s", exc)
         await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
 
@@ -41,13 +42,19 @@ async def _periodic_sync_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _diagnostics_cache
-    engine.initialize()
+    read_only = bool(getattr(app.state, "read_only", False)) or (
+        os.environ.get("OFD1_READ_ONLY", "0") == "1"
+    )
+    engine.initialize(read_only=read_only)
     _diagnostics_cache = engine.get_diagnostics_summary()
-    sync_task = asyncio.create_task(_periodic_sync_loop())
+    sync_task: asyncio.Task[None] | None = None
+    if not read_only:
+        sync_task = asyncio.create_task(_periodic_sync_loop())
     yield
-    sync_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await sync_task
+    if sync_task is not None:
+        sync_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sync_task
 
 
 app = FastAPI(
@@ -66,6 +73,7 @@ async def index() -> FileResponse:
 
 
 @app.get("/api/health")
+@app.get("/health")
 async def health() -> dict[str, Any]:
     return {
         "status": "ok",
@@ -80,12 +88,43 @@ async def get_dashboard() -> dict[str, Any]:
     return engine.latest_payload
 
 
+@app.get("/api/v1/status")
+async def get_v1_status() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "sync_status": engine.sync_status,
+        "generated_at_utc": engine.latest_payload.get("generated_at_utc"),
+        "current": engine.latest_payload.get("current", {}),
+        "gauges": engine.latest_payload.get("gauges", {}),
+    }
+
+
+@app.get("/api/v1/forecast")
+async def get_v1_forecast() -> dict[str, Any]:
+    return {
+        "generated_at_utc": engine.latest_payload.get("generated_at_utc"),
+        "current": engine.latest_payload.get("current", {}),
+        "nwp_ensemble": engine.latest_payload.get("nwp_ensemble", {}),
+        "forecast_48h": engine.latest_payload.get("forecast_48h", []),
+        "forecast_anchors": engine.latest_payload.get("forecast_anchors", []),
+    }
+
+
+@app.get("/api/v1/history")
+async def get_v1_history() -> dict[str, Any]:
+    return {
+        "generated_at_utc": engine.latest_payload.get("generated_at_utc"),
+        "history_72h": engine.latest_payload.get("history_72h", []),
+    }
+
+
 @app.post("/api/refresh")
 async def force_refresh() -> dict[str, Any]:
     return await engine.refresh_live_telemetry()
 
 
 @app.get("/api/simulate")
+@app.get("/api/v1/simulate")
 async def simulate_storm(
     rain_6h_mm: float = Query(15.0, ge=0.0, le=60.0, description="6-hour cumulative rainfall (mm)"),
     moisture_pct: float = Query(80.0, ge=5.0, le=120.0, description="Peat bog saturation index (%)"),
@@ -107,6 +146,7 @@ async def get_diagnostics() -> dict[str, Any]:
 
 
 @app.get("/api/verification")
+@app.get("/api/v1/verification")
 async def get_verification(
     horizon_h: int = Query(2, description="Forecast lead horizon in hours (1, 2, 3, 6, 12, 18, 24, 36, 48)"),
     window: str = Query("oct_2026_floods", description="Evaluation time window"),
@@ -114,6 +154,19 @@ async def get_verification(
     if horizon_h not in [1, 2, 3, 6, 12, 18, 24, 36, 48]:
         horizon_h = 2
     return engine.get_verification_history(horizon_h=horizon_h, window=window)
+
+
+@app.get("/api/v1/nwp-backtest")
+async def get_v1_nwp_backtest() -> dict[str, Any]:
+    if not engine.ensemble_backtest_summary_path.exists():
+        return {"horizons": [], "records": []}
+    df = pd.read_csv(engine.ensemble_backtest_summary_path)
+    horizons = sorted(df["horizon_h"].astype(int).unique().tolist()) if "horizon_h" in df.columns else []
+    records = df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
+    return {
+        "horizons": horizons,
+        "records": records,
+    }
 
 
 @app.get("/api/forecast-evolution")

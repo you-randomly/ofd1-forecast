@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -13,75 +13,57 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-logger = logging.getLogger("ofd1.engine")
-
-HORIZONS = [1, 2, 3, 6, 12, 18, 24, 36, 48]
-STEP_DATUM_MM = 550.0
-AMBER_DEPTH_MM = 620.0
-RED_DEPTH_MM = 700.0  # ~6 inches over The Step
-RED_TRIGGER_DEPTH_MM = 705.0  # Rising limb trigger threshold (prevents edge-touching false alarms)
-RED_CLEAR_DEPTH_MM = 675.0  # Falling limb clearance threshold (hysteresis deadband)
-TRAIN_SPLIT_UTC = pd.Timestamp("2026-01-01 00:00:00+00:00")
-
-CAUSAL_COLS = (
-    [
-        "depth_mm",
-        "stage_above_base",
-        "baseflow_30d",
-        "ddepth_1h",
-        "ddepth_2h",
-        "ddepth_3h",
-        "ddepth_4h",
-        "ddepth_6h",
-        "ddepth_12h",
-        "ddepth_24h",
-        "accel_1h",
-        "moisture_index",
-        "era5_soil_moisture",
-        "era5_soil_deep",
-        "tank_3h",
-        "tank_6h",
-        "tank_12h",
-        "tank_24h",
-        "tank_96h",
-        "tank_168h",
-        "ref_tank_6h",
-        "ref_tank_96h",
-        "wind_kmh",
-        "temp_c",
-        "press_hpa",
-        "dpress_3h",
-        "dpress_6h",
-    ]
-    + [f"fused_rain_lag_{k}h" for k in range(0, 7)]
-    + [f"ref_rain_lag_{k}h" for k in range(0, 7)]
-    + [f"eff_rain_lag_{k}h" for k in range(0, 7)]
-    + [f"fused_rain_sum_{w}h" for w in [2, 3, 6, 12, 24]]
-    + [f"ref_rain_sum_{w}h" for w in [2, 3, 6, 12, 24]]
-    + [f"eff_rain_sum_{w}h" for w in [2, 3, 6, 12, 24]]
+from app.hydrology import (
+    AMBER_DEPTH_MM,
+    CAUSAL_COLS,
+    ELEVATED_DEPTH_MM,
+    HORIZONS,
+    MIN_PHYSICAL_DEPTH_MM,
+    RED_CLEAR_DEPTH_MM,
+    RED_DEPTH_MM,
+    RED_TRIGGER_DEPTH_MM,
+    STEP_DATUM_MM,
+    TRAIN_SPLIT_UTC,
+    apply_hydrological_guardrails,
+    attach_horizon_future_cols,
+    combine_ensemble_quantile_deltas,
+    engineer_features,
+    enrich_nwp_ensemble_quantiles,
+    evaluate_alert_hysteresis,
+    nwp_cols_for_horizon,
+    reconstruct_depth_quantiles,
+    roll_future_features_for_horizon,
+    roll_future_moisture_series,
 )
 
+logger = logging.getLogger("ofd1.engine")
 
-def nwp_cols_for_horizon(h: int) -> list[str]:
-    cols = [
-        "fut_ref_tank_6h",
-        "fut_ref_tank_24h",
-        "fut_ref_tank_96h",
-        "fut_rain_sum_6h_at_target",
-        "fut_rain_sum_12h_at_target",
-        "fut_eff_rain_sum_6h_at_target",
-    ]
-    for k in range(0, min(h, 6)):
-        cols.append(f"fut_rain_minus_{k}h_from_target")
-    return cols
+__all__ = [
+    "AMBER_DEPTH_MM",
+    "CAUSAL_COLS",
+    "ELEVATED_DEPTH_MM",
+    "HORIZONS",
+    "MIN_PHYSICAL_DEPTH_MM",
+    "RED_CLEAR_DEPTH_MM",
+    "RED_DEPTH_MM",
+    "RED_TRIGGER_DEPTH_MM",
+    "STEP_DATUM_MM",
+    "TRAIN_SPLIT_UTC",
+    "OFD1ForecastEngine",
+    "nwp_cols_for_horizon",
+]
 
 
 class OFD1ForecastEngine:
     """Manages telemetry synchronization, feature engineering, and multi-horizon P10/P50/P90 inference."""
 
-    def __init__(self, data_dir: Path | str = "data") -> None:
+    def __init__(self, data_dir: Path | str = "data", read_only: bool | None = None) -> None:
         self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.read_only: bool = (
+            bool(read_only)
+            if read_only is not None
+            else (os.environ.get("OFD1_READ_ONLY", "0") == "1")
+        )
         self.aligned_1h_path = self.data_dir / "ofd1_aligned_hourly.parquet"
         self.raw_ts_path = self.data_dir / "ofd1_thingspeak_raw.parquet"
         self.models_path = self.data_dir / "ofd1_models_v1.joblib"
@@ -98,20 +80,26 @@ class OFD1ForecastEngine:
         self.df_future_wx: pd.DataFrame = pd.DataFrame()
         self.df_nwp_archive: pd.DataFrame = pd.DataFrame()
         self.df_feat_cached: pd.DataFrame = pd.DataFrame()
+        self.df_ledger_cached: pd.DataFrame = pd.DataFrame()
         self._verification_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self.last_sync_utc: str | None = None
         self.sync_status: str = "initializing"
         self.latest_payload: dict[str, Any] = {}
 
-    def initialize(self) -> None:
+    def initialize(self, read_only: bool | None = None) -> None:
         """Load cached hourly dataset and load or train the multi-horizon quantile models."""
-        seed_dir = Path(os.environ.get("OFD1_SEED_DIR", "seed_data"))
-        if seed_dir.exists() and seed_dir.resolve() != self.data_dir.resolve():
-            for item in seed_dir.glob("*"):
-                dest = self.data_dir / item.name
-                if not dest.exists():
-                    shutil.copy2(item, dest)
-                    logger.info("Seeded PVC data file %s from %s", dest, item)
+        if read_only is not None:
+            self.read_only = bool(read_only)
+
+        if not self.read_only:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            seed_dir = Path(os.environ.get("OFD1_SEED_DIR", "seed_data"))
+            if seed_dir.exists() and seed_dir.resolve() != self.data_dir.resolve():
+                for item in seed_dir.glob("*"):
+                    dest = self.data_dir / item.name
+                    if not dest.exists():
+                        shutil.copy2(item, dest)
+                        logger.info("Seeded PVC data file %s from %s", dest, item)
 
         if not self.aligned_1h_path.exists():
             raise FileNotFoundError(f"Missing aligned telemetry dataset at {self.aligned_1h_path}")
@@ -189,7 +177,8 @@ class OFD1ForecastEngine:
             self.df_hourly = self.df_hourly[
                 ~self.df_hourly.index.duplicated(keep="last")
             ].sort_index()
-            self.df_hourly.to_parquet(self.aligned_1h_path)
+            if not self.read_only:
+                self.df_hourly.to_parquet(self.aligned_1h_path)
 
         df_feat = self._engineer_features(self.df_hourly)
         self.df_feat_cached = df_feat
@@ -197,14 +186,14 @@ class OFD1ForecastEngine:
         if self.nwp_archive_path.exists():
             try:
                 self.df_nwp_archive = pd.read_parquet(self.nwp_archive_path).sort_index()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not load NWP archive (%s)", exc)
 
         if self.models_path.exists():
             try:
                 self.models = joblib.load(self.models_path)
                 logger.info("Loaded cached multi-horizon models from %s", self.models_path)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load cached models (%s), retraining...", exc)
                 self._train_and_save_models(df_feat)
         else:
@@ -213,86 +202,20 @@ class OFD1ForecastEngine:
         if self.future_wx_path.exists():
             try:
                 self.df_future_wx = pd.read_parquet(self.future_wx_path).sort_index()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not load cached future NWP ensemble (%s)", exc)
 
         # Build initial payload from cached data before network sync
         self.latest_payload = self._build_dashboard_payload(df_feat, self.df_future_wx)
-        self._ensure_and_update_verification_ledger(df_feat)
+        self._ensure_and_update_verification_ledger(df_feat, read_only=self.read_only)
         self._verification_cache.clear()
         self.sync_status = "ready"
 
     def _engineer_features(self, df_in: pd.DataFrame) -> pd.DataFrame:
-        df = df_in.copy().sort_index()
-
-        # 1. Glitch-filtered Stump rain
-        stump_glitch = (df["stump_rain_mm"] >= 15.0) & (
-            (df["swcc_rain_mm"].fillna(0) < 5.0) & (df["rain_mm"].fillna(0) < 5.0)
-        )
-        df["stump_glitch_flag"] = stump_glitch
-        df["stump_rain_clean"] = df["stump_rain_mm"].mask(stump_glitch, np.nan)
-        df["club_rain_mean"] = df[["stump_rain_clean", "swcc_rain_mm"]].mean(axis=1)
-        df["fused_rain_mm"] = df["club_rain_mean"].fillna(df["rain_mm"]).fillna(0.0)
-
-        wind_factor = 1.0 + 0.004 * (df["wind_kmh"].fillna(15.0) - 15.0).clip(lower=0.0)
-        df["fused_rain_wind_adj"] = df["fused_rain_mm"] * wind_factor
-
-        # 2. Rolling 30-day (720h) 5th-percentile baseflow datum
-        df["baseflow_30d"] = df["depth_mm"].rolling(720, min_periods=24).quantile(0.05).bfill()
-        df["stage_above_base"] = df["depth_mm"] - df["baseflow_30d"]
-
-        # 3. Antecedent moisture tanks
-        et0 = df["et0_mm"].fillna(0.05)
-        net_rain = (df["fused_rain_mm"] - 0.8 * et0).clip(lower=0.0)
-        rain_ref = df["rain_mm"].fillna(df["fused_rain_mm"]).fillna(0.0)
-
-        for hl in [3, 6, 12, 24, 96, 168]:
-            alpha = 1.0 - np.exp(-np.log(2) / hl)
-            df[f"tank_{hl}h"] = net_rain.ewm(alpha=alpha, adjust=False).mean()
-            df[f"ref_tank_{hl}h"] = rain_ref.ewm(alpha=alpha, adjust=False).mean()
-
-        soil_min = df["era5_soil_moisture"].expanding(min_periods=48).min().fillna(0.30)
-        soil_max = df["era5_soil_moisture"].expanding(min_periods=48).max().fillna(0.43)
-        sat_norm = ((df["era5_soil_moisture"].ffill() - soil_min) / (soil_max - soil_min + 1e-6)).clip(0.05, 1.0)
-        tank_norm = (
-            df["tank_168h"] / (df["tank_168h"].expanding(min_periods=48).quantile(0.95) + 1e-6)
-        ).clip(0.05, 1.5)
-        df["moisture_index"] = (0.5 * sat_norm + 0.5 * tank_norm).fillna(0.5)
-        df["eff_rain_mm"] = df["fused_rain_wind_adj"] * (df["moisture_index"] ** 1.5)
-
-        # 4. Depth lags & velocity
-        for lag in [1, 2, 3, 4, 6, 12, 24]:
-            df[f"ddepth_{lag}h"] = df["depth_mm"] - df["depth_mm"].shift(lag)
-        df["accel_1h"] = df["ddepth_1h"] - df["ddepth_1h"].shift(1)
-
-        # 5. Rain lags & rolling sums
-        for lag in range(0, 7):
-            df[f"fused_rain_lag_{lag}h"] = df["fused_rain_wind_adj"].shift(lag)
-            df[f"ref_rain_lag_{lag}h"] = rain_ref.shift(lag)
-            df[f"eff_rain_lag_{lag}h"] = df["eff_rain_mm"].shift(lag)
-
-        for win in [2, 3, 6, 12, 24]:
-            df[f"fused_rain_sum_{win}h"] = df["fused_rain_wind_adj"].rolling(win).sum()
-            df[f"ref_rain_sum_{win}h"] = rain_ref.rolling(win).sum()
-            df[f"eff_rain_sum_{win}h"] = df["eff_rain_mm"].rolling(win).sum()
-
-        df["press_hpa"] = df["swcc_press_hpa"].fillna(df["stump_press_hpa"]).fillna(df["era5_press_hpa"])
-        df["dpress_3h"] = df["press_hpa"] - df["press_hpa"].shift(3)
-        df["dpress_6h"] = df["press_hpa"] - df["press_hpa"].shift(6)
-
-        return df
+        return engineer_features(df_in)
 
     def _attach_horizon_future_cols(self, df: pd.DataFrame, h: int) -> pd.DataFrame:
-        work = df.copy()
-        work["fut_ref_tank_6h"] = work["ref_tank_6h"].shift(-h)
-        work["fut_ref_tank_24h"] = work["tank_24h"].shift(-h)
-        work["fut_ref_tank_96h"] = work["ref_tank_96h"].shift(-h)
-        work["fut_rain_sum_6h_at_target"] = work["ref_rain_sum_6h"].shift(-h)
-        work["fut_rain_sum_12h_at_target"] = work["ref_rain_sum_12h"].shift(-h)
-        work["fut_eff_rain_sum_6h_at_target"] = work["eff_rain_sum_6h"].shift(-h)
-        for k in range(0, min(h, 6)):
-            work[f"fut_rain_minus_{k}h_from_target"] = work["rain_mm"].shift(-(h - k))
-        return work
+        return attach_horizon_future_cols(df, h)
 
     @staticmethod
     def _apply_hydrological_guardrails(
@@ -307,47 +230,18 @@ class OFD1ForecastEngine:
         d_p50: np.ndarray | float,
         d_p90: np.ndarray | float,
     ) -> tuple[np.ndarray | float, np.ndarray | float, np.ndarray | float]:
-        """Apply physical karst rate-of-rise and peat sponge infiltration guardrails.
-
-        Prevents unphysical flood pulses when antecedent peat moisture and available rainfall
-        cannot physically generate the water volume needed to submerge The Step (>= 700 mm).
-        """
-        is_scalar = np.isscalar(base_depth) or isinstance(base_depth, float)
-        b_d = np.asarray(base_depth, dtype=float)
-        dd1 = np.asarray(ddepth_1h, dtype=float)
-        r3h = np.maximum(0.0, np.asarray(fused_rain_3h, dtype=float))
-        rfut = np.maximum(0.0, np.asarray(fut_rain_sum, dtype=float))
-        m_idx = np.asarray(moisture_index, dtype=float)
-        t168 = np.asarray(tank_168h, dtype=float)
-        dp10 = np.asarray(d_p10, dtype=float)
-        dp50 = np.asarray(d_p50, dtype=float)
-        dp90 = np.asarray(d_p90, dtype=float)
-
-        rain_avail = r3h + rfut
-        sat_factor = np.clip(m_idx ** 1.5, 0.15, 1.0)
-
-        # Peat sponge absorption deduction: when 7-day tank is dry (< 0.5), initial ~8mm rain is retained
-        sponge_deduct = np.where(t168 < 0.5, 8.0, 0.0)
-        eff_rain = np.maximum(0.0, rain_avail - sponge_deduct) * sat_factor
-
-        # Maximum physical rise for OFD1 karst:
-        # 25mm baseflow buffer + 12mm rise per 1mm effective rain
-        max_phys_rise = 25.0 + 12.0 * eff_rain
-
-        # Slew rate limit: max 30-35 mm/h for lead times <= 6h unless rain is heavy
-        max_rate_rise = np.where(eff_rain < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
-        allowed_rise = np.minimum(max_phys_rise, max_rate_rise)
-
-        # Apply clamp only when base depth is below Amber (< 620 mm) and not already surging (ddepth_1h < 15 mm)
-        clamp_mask = (b_d < 620.0) & (dd1 < 15.0)
-
-        clamped_p50 = np.where(clamp_mask, np.minimum(dp50, allowed_rise), dp50)
-        clamped_p90 = np.where(clamp_mask, np.minimum(dp90, allowed_rise * 1.5 + 20.0), dp90)
-        clamped_p10 = np.where(clamp_mask, np.minimum(dp10, clamped_p50), dp10)
-
-        if is_scalar:
-            return float(clamped_p10), float(clamped_p50), float(clamped_p90)
-        return clamped_p10, clamped_p50, clamped_p90
+        return apply_hydrological_guardrails(
+            base_depth=base_depth,
+            ddepth_1h=ddepth_1h,
+            fused_rain_3h=fused_rain_3h,
+            moisture_index=moisture_index,
+            tank_168h=tank_168h,
+            horizon_h=horizon_h,
+            fut_rain_sum=fut_rain_sum,
+            d_p10=d_p10,
+            d_p50=d_p50,
+            d_p90=d_p90,
+        )
 
     def _train_and_save_models(self, df_feat: pd.DataFrame) -> None:
         logger.info(
@@ -411,8 +305,9 @@ class OFD1ForecastEngine:
             trained[h] = {"p10": m_p10, "p50": m_p50, "p90": m_p90}
 
         self.models = trained
-        joblib.dump(self.models, self.models_path)
-        logger.info("Saved trained models to %s", self.models_path)
+        if not self.read_only:
+            joblib.dump(self.models, self.models_path)
+            logger.info("Saved trained models to %s", self.models_path)
 
     async def refresh_live_telemetry(self) -> dict[str, Any]:
         """Fetch latest ThingSpeak packets + Open-Meteo 48h NWP forecast and recompute dashboard state."""
@@ -568,7 +463,7 @@ class OFD1ForecastEngine:
                             common_ens = df_om.index.intersection(ens_df.index)
                             for col in ens_df.columns:
                                 df_om.loc[common_ens, col] = ens_df.loc[common_ens, col]
-                    except Exception as ens_exc:
+                    except Exception as ens_exc:  # noqa: BLE001
                         logger.warning("Multi-model NWP ensemble query fallback: %s", ens_exc)
 
                     # Update historical weather columns and store future weather rows
@@ -600,184 +495,34 @@ class OFD1ForecastEngine:
 
                     last_obs_ts = self.df_hourly.dropna(subset=["depth_mm"]).index.max()
                     self.df_future_wx = df_om[df_om.index > last_obs_ts].head(48).copy()
-                    try:
-                        self.df_future_wx.to_parquet(self.future_wx_path)
-                    except Exception as exc:
-                        logger.warning("Could not persist future NWP parquet: %s", exc)
+                    if not self.read_only:
+                        try:
+                            self.df_future_wx.to_parquet(self.future_wx_path)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Could not persist future NWP parquet: %s", exc)
 
-                    # Persist updated hourly parquet to PVC
-                    self.df_hourly.to_parquet(self.aligned_1h_path)
+                        # Persist updated hourly parquet to PVC
+                        self.df_hourly.to_parquet(self.aligned_1h_path)
 
-            self.last_sync_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            self.last_sync_utc = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
             self.sync_status = "live_synced"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Live telemetry sync fallback (using cached PVC data): %s", exc)
             self.sync_status = f"cached_offline ({type(exc).__name__})"
             if not self.last_sync_utc:
-                self.last_sync_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                self.last_sync_utc = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         df_feat = self._engineer_features(self.df_hourly)
         self.df_feat_cached = df_feat
         self.latest_payload = self._build_dashboard_payload(df_feat, self.df_future_wx)
-        self._ensure_and_update_verification_ledger(df_feat)
+        self._ensure_and_update_verification_ledger(df_feat, read_only=self.read_only)
         self._verification_cache.clear()
         return self.latest_payload
 
     def _enrich_nwp_ensemble_quantiles(
-        self, fut_wx: pd.DataFrame, now_row: pd.Series, use_ensemble: bool = True
+        self, fut_wx: pd.DataFrame, now_row: pd.Series | dict[str, Any], use_ensemble: bool = True
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
-        """Compute hourly NWP precipitation quantiles (P10/P50/P90) from the 6-model NWP super-ensemble + convective PoP.
-
-        With ``use_ensemble=False`` the deterministic ``rain_mm`` trajectory is used for all three quantiles,
-        reproducing the pre-ensemble (hydrological-uncertainty-only) forecast band for backtesting.
-        """
-        df_w = fut_wx.copy()
-        n_hrs = len(df_w)
-        lead_hours = np.arange(1, n_hrs + 1, dtype=float)
-        # Lead-time growth factor for +6h..+48h NWP placement & intensity uncertainty
-        lead_factor = np.clip((lead_hours - 2.0) / 24.0, 0.05, 1.50)
-
-        det_rain = (
-            pd.to_numeric(df_w["rain_mm"], errors="coerce").fillna(0.0).values
-            if "rain_mm" in df_w.columns
-            else np.zeros(n_hrs, dtype=float)
-        )
-        if not use_ensemble:
-            det = np.round(det_rain, 2)
-            df_w["rain_p10_mm"] = det
-            df_w["rain_p50_mm"] = det
-            df_w["rain_p90_mm"] = det
-            df_w["rain_mm"] = det
-            if "precip_prob_pct" not in df_w.columns:
-                df_w["precip_prob_pct"] = 0.0
-            df_w["precip_prob_pct"] = pd.to_numeric(df_w["precip_prob_pct"], errors="coerce").fillna(0.0)
-            meta = {
-                "models_count": 1,
-                "mode": "Deterministic NWP (hydrological uncertainty only)",
-                "rain_24h_p10_mm": round(float(det[:24].sum()), 1),
-                "rain_24h_p50_mm": round(float(det[:24].sum()), 1),
-                "rain_24h_p90_mm": round(float(det[:24].sum()), 1),
-                "rain_48h_p10_mm": round(float(det[:48].sum()), 1),
-                "rain_48h_p50_mm": round(float(det[:48].sum()), 1),
-                "rain_48h_p90_mm": round(float(det[:48].sum()), 1),
-                "max_precip_prob_pct": int(round(float(df_w["precip_prob_pct"].max()) if n_hrs else 0)),
-                "members": [],
-            }
-            return df_w, meta
-        prob_col = (
-            "ens_prob_max_pct"
-            if "ens_prob_max_pct" in df_w.columns
-            else ("precip_prob_pct" if "precip_prob_pct" in df_w.columns else None)
-        )
-        prob_pct = (
-            pd.to_numeric(df_w[prob_col], errors="coerce").fillna(0.0).values
-            if prob_col
-            else np.zeros(n_hrs, dtype=float)
-        )
-        showers = (
-            pd.to_numeric(df_w["showers_mm"], errors="coerce").fillna(0.0).values
-            if "showers_mm" in df_w.columns
-            else np.zeros(n_hrs, dtype=float)
-        )
-
-        member_map = {
-            "nwp_ukmo_seamless": "UKMO 2km UKV",
-            "nwp_ecmwf_ifs025": "ECMWF IFS 0.25°",
-            "nwp_icon_seamless": "DWD ICON-EU",
-            "nwp_meteofrance_seamless": "Météo-France AROME",
-            "nwp_gfs_seamless": "NOAA GFS",
-            "nwp_best_match": "Open-Meteo Blend",
-        }
-        avail_cols = [c for c in member_map if c in df_w.columns and df_w[c].notna().any()]
-
-        if avail_cols:
-            mat = np.vstack(
-                [
-                    np.where(
-                        df_w[c].notna(),
-                        pd.to_numeric(df_w[c], errors="coerce").values,
-                        det_rain,
-                    )
-                    for c in avail_cols
-                ]
-            )
-            ens_min = np.nanpercentile(mat, 10, axis=0)
-            ens_med = np.nanpercentile(mat, 50, axis=0)
-            raw_ens_max = np.nanpercentile(mat, 90, axis=0)
-
-            # Consensus Quorum: require >= 2 models predicting rain (>= 0.6 mm/h) before allowing outlier expansion
-            wet_members_count = np.sum(mat >= 0.6, axis=0)
-            ens_max = np.where(
-                wet_members_count >= 2,
-                raw_ens_max,
-                np.minimum(raw_ens_max, 0.5 * (ens_med + raw_ens_max)),
-            )
-
-            rain_p50 = np.round(0.5 * det_rain + 0.5 * ens_med, 2)
-            rain_p10 = np.round(np.minimum(rain_p50, ens_min), 2)
-
-            # Conserve 48h ensemble storm volume so timing jitter across models does not inflate total volume beyond member P90
-            member_totals_48h = np.nansum(mat[:, :48], axis=1)
-            high_vol_members = int(np.sum(member_totals_48h >= 10.0))
-            if high_vol_members >= 2:
-                target_p90_total = float(np.nanpercentile(member_totals_48h, 90))
-            else:
-                target_p90_total = float(np.nanpercentile(member_totals_48h, 75))
-
-            raw_p90 = np.maximum(rain_p50, ens_max)
-            raw_p90_sum = float(np.sum(raw_p90[:48]))
-            if raw_p90_sum > 1e-3 and target_p90_total > 0.0:
-                vol_scale = np.clip(target_p90_total / raw_p90_sum, 0.55, 1.15)
-                rain_p90 = np.round( np.maximum(rain_p50, raw_p90 * vol_scale), 2)
-            else:
-                rain_p90 = np.round(raw_p90, 2)
-
-            members_summary = [
-                {
-                    "id": col.replace("nwp_", ""),
-                    "label": member_map[col],
-                    "rain_24h_mm": round(float(pd.to_numeric(df_w[col], errors="coerce").fillna(0.0).iloc[:24].sum()), 1),
-                    "rain_48h_mm": round(float(pd.to_numeric(df_w[col], errors="coerce").fillna(0.0).iloc[:48].sum()), 1),
-                    "peak_1h_mm": round(float(pd.to_numeric(df_w[col], errors="coerce").fillna(0.0).max()), 2),
-                }
-                for col in avail_cols
-            ]
-        else:
-            # Synoptic fallback when running offline without cached multi-model columns
-            press_now = float(now_row.get("press_hpa", 985.0))
-            low_press_boost = np.clip((1002.0 - press_now) / 25.0, 0.0, 1.0)
-            rain_p50 = np.round(det_rain, 2)
-            rain_p10 = np.round(det_rain * np.clip(1.0 - 0.45 * np.sqrt(lead_factor), 0.2, 0.85), 2)
-            synoptic_tail = np.where(
-                lead_hours >= 6,
-                (0.12 * low_press_boost + 0.45 * det_rain) * np.sqrt(lead_factor),
-                0.25 * det_rain,
-            )
-            rain_p90 = np.round(rain_p50 + synoptic_tail, 2)
-            prob_pct = np.where(rain_p90 > 0.1, np.clip(rain_p90 * 45.0, 15.0, 95.0), 10.0)
-            members_summary = []
-
-        df_w["rain_p10_mm"] = rain_p10
-        df_w["rain_p50_mm"] = rain_p50
-        df_w["rain_p90_mm"] = rain_p90
-        df_w["rain_mm"] = rain_p50
-        df_w["precip_prob_pct"] = np.round(prob_pct, 0)
-
-        meta = {
-            "models_count": len(avail_cols) if avail_cols else 1,
-            "mode": "6-Model NWP Super-Ensemble (UKMO 2km • ECMWF • ICON • AROME • GFS)"
-            if avail_cols
-            else "Synoptic NWP Spread Fallback",
-            "rain_24h_p10_mm": round(float(rain_p10[:24].sum()), 1),
-            "rain_24h_p50_mm": round(float(rain_p50[:24].sum()), 1),
-            "rain_24h_p90_mm": round(float(rain_p90[:24].sum()), 1),
-            "rain_48h_p10_mm": round(float(rain_p10[:48].sum()), 1),
-            "rain_48h_p50_mm": round(float(rain_p50[:48].sum()), 1),
-            "rain_48h_p90_mm": round(float(rain_p90[:48].sum()), 1),
-            "max_precip_prob_pct": int(round(float(np.nanmax(prob_pct)) if len(prob_pct) else 0)),
-            "members": members_summary,
-        }
-        return df_w, meta
+        return enrich_nwp_ensemble_quantiles(fut_wx, now_row, use_ensemble=use_ensemble)
 
     def _forecast_anchors(
         self,
@@ -832,30 +577,20 @@ class OFD1ForecastEngine:
             fut_wx, now_row, use_ensemble=use_ensemble
         )
 
-        # Roll 3 distinct NWP ensemble trajectories (P10 dry, P50 median, P90 wet upper bound) through the peat/epikarst tanks
-        obs_tail = valid_obs.loc[:now_ts].tail(800)
-
-        fut_wx_p10 = fut_wx.copy()
-        fut_wx_p10["rain_mm"] = fut_wx["rain_p10_mm"]
-        ext_df_p10 = pd.concat([obs_tail, fut_wx_p10], axis=0)
-        ext_df_p10 = ext_df_p10[~ext_df_p10.index.duplicated(keep="first")].sort_index()
-        ext_feat_p10 = self._engineer_features(ext_df_p10)
-
-        fut_wx_p50 = fut_wx.copy()
-        fut_wx_p50["rain_mm"] = fut_wx["rain_p50_mm"]
-        ext_df_p50 = pd.concat([obs_tail, fut_wx_p50], axis=0)
-        ext_df_p50 = ext_df_p50[~ext_df_p50.index.duplicated(keep="first")].sort_index()
-        ext_feat = self._engineer_features(ext_df_p50)
-
-        fut_wx_p90 = fut_wx.copy()
-        fut_wx_p90["rain_mm"] = fut_wx["rain_p90_mm"]
-        ext_df_p90 = pd.concat([obs_tail, fut_wx_p90], axis=0)
-        ext_df_p90 = ext_df_p90[~ext_df_p90.index.duplicated(keep="first")].sort_index()
-        ext_feat_p90 = self._engineer_features(ext_df_p90)
+        # Roll 3 distinct NWP ensemble trajectories (P10 dry, P50 median, P90 wet upper bound)
+        # using vectorized 1st-order EWM on full-history expanding bounds (no .tail(800) drift)
+        obs_up_to_now = valid_obs.loc[:now_ts]
+        issue_idx = pd.DatetimeIndex([now_ts])
+        p10_mat = fut_wx["rain_p10_mm"].values[None, :48]
+        p50_mat = fut_wx["rain_p50_mm"].values[None, :48]
+        p90_mat = fut_wx["rain_p90_mm"].values[None, :48]
+        ext_feat = pd.DataFrame(
+            {"moisture_index": roll_future_moisture_series(now_row, fut_wx)},
+            index=fut_wx.index,
+        )
 
         # Predict at anchor timestamp `now_ts` across all HORIZONS
         base_depth = float(now_row["depth_mm"])
-        baseflow_30d = float(now_row["baseflow_30d"])
         now_rain = round(float(now_row.get("fused_rain_mm", 0.0)), 2)
         anchor_Points = [
             {
@@ -875,31 +610,25 @@ class OFD1ForecastEngine:
         ]
 
         for h in HORIZONS:
-            f_cols = CAUSAL_COLS + nwp_cols_for_horizon(h)
-            work_p10 = self._attach_horizon_future_cols(ext_feat_p10, h)
-            work_p50 = self._attach_horizon_future_cols(ext_feat, h)
-            work_p90 = self._attach_horizon_future_cols(ext_feat_p90, h)
+            x_row_p10 = roll_future_features_for_horizon(obs_up_to_now, issue_idx, p10_mat, h)
+            x_row_p50 = roll_future_features_for_horizon(obs_up_to_now, issue_idx, p50_mat, h)
+            x_row_p90 = roll_future_features_for_horizon(obs_up_to_now, issue_idx, p90_mat, h)
 
-            x_row_p10 = work_p10.loc[[now_ts], f_cols]
-            x_row_p50 = work_p50.loc[[now_ts], f_cols]
-            x_row_p90 = work_p90.loc[[now_ts], f_cols]
-
-            # Median P50 on P50 NWP trajectory
             d_p50 = float(self.models[h]["p50"].predict(x_row_p50)[0])
-            # Lower P10 combining hydrological P10 spread and dry-member NWP shift in quadrature
-            d_p10_det = float(self.models[h]["p10"].predict(x_row_p10)[0])
+            d_p10_on_p50 = float(self.models[h]["p10"].predict(x_row_p50)[0])
             d_p50_on_p10 = float(self.models[h]["p50"].predict(x_row_p10)[0])
-            delta_hydro_low = max(0.0, d_p50 - float(self.models[h]["p10"].predict(x_row_p50)[0]))
-            delta_nwp_low = max(0.0, d_p50 - d_p50_on_p10)
-            total_low_spread = float(np.sqrt(delta_hydro_low**2 + delta_nwp_low**2))
-
-            # Upper P90 combining hydrological P90 spread and wet-member NWP shift in quadrature (avoids P90-of-P90 double counting)
-            d_p90_det = float(self.models[h]["p90"].predict(x_row_p50)[0])
-            d_p90_ens = float(self.models[h]["p90"].predict(x_row_p90)[0])
+            d_p90_on_p50 = float(self.models[h]["p90"].predict(x_row_p50)[0])
+            d_p90_on_p90 = float(self.models[h]["p90"].predict(x_row_p90)[0])
             d_p50_on_p90 = float(self.models[h]["p50"].predict(x_row_p90)[0])
-            delta_hydro_high = max(0.0, d_p90_det - d_p50)
-            delta_nwp_high = max(0.0, d_p50_on_p90 - d_p50, 0.35 * (d_p90_ens - d_p90_det))
-            total_high_spread = float(np.sqrt(delta_hydro_high**2 + delta_nwp_high**2))
+
+            d_p10_rel, d_p50_rel, d_p90_rel, delta_hydro_high = combine_ensemble_quantile_deltas(
+                d_p50=d_p50,
+                d_p10_on_p50=d_p10_on_p50,
+                d_p50_on_p10=d_p50_on_p10,
+                d_p90_on_p50=d_p90_on_p50,
+                d_p90_on_p90=d_p90_on_p90,
+                d_p50_on_p90=d_p50_on_p90,
+            )
 
             # Apply physical karst rate-of-rise and peat sponge infiltration guardrails
             fused_3h = float(now_row.get("fused_rain_sum_3h", 0.0))
@@ -920,17 +649,18 @@ class OFD1ForecastEngine:
                 tank_168h=t_168,
                 horizon_h=h,
                 fut_rain_sum=fut_sum,
-                d_p10=-total_low_spread,
-                d_p50=d_p50,
-                d_p90=d_p50 + total_high_spread,
+                d_p10=d_p10_rel,
+                d_p50=d_p50_rel,
+                d_p90=d_p90_rel,
             )
 
-            p50 = max(350.0, base_depth + d_p50_c)
-            p10 = max(350.0, min(p50, p50 + d_p10_c))
-            p90_hydro_only = max(
-                p50, min(base_depth + d_p90_c, base_depth + d_p50_c + delta_hydro_high)
+            p10, p50, p90, p90_hydro_only = reconstruct_depth_quantiles(
+                base_depth=base_depth,
+                d_p10_c=d_p10_c,
+                d_p50_c=d_p50_c,
+                d_p90_c=d_p90_c,
+                delta_hydro_high=delta_hydro_high,
             )
-            p90 = max(p50, base_depth + d_p90_c)
 
             target_ts = now_ts + pd.Timedelta(hours=h)
             fut_rain = (
@@ -949,7 +679,7 @@ class OFD1ForecastEngine:
                 else 0.0
             )
             fut_prob = (
-                int(round(float(fut_wx.loc[target_ts, "precip_prob_pct"])))
+                round(float(fut_wx.loc[target_ts, "precip_prob_pct"]))
                 if target_ts in fut_wx.index
                 else 0
             )
@@ -1000,15 +730,25 @@ class OFD1ForecastEngine:
 
         # Interpolate smooth hourly trajectory from 0..48h for the hydrograph & table
         df_anchors = pd.DataFrame(anchor_Points).set_index("horizon_h")
-        full_h = pd.Index(range(0, 49), name="horizon_h")
+        full_h = pd.Index(range(49), name="horizon_h")
         df_interp = (
             df_anchors[["p10_mm", "p50_mm", "p90_mm", "p90_hydro_only_mm"]]
             .reindex(full_h)
             .interpolate("index")
         )
 
+        p50_hourly = [round(float(df_interp.loc[h_step, "p50_mm"]), 1) for h_step in range(1, 49)]
+        p90_hourly = [round(float(df_interp.loc[h_step, "p90_mm"]), 1) for h_step in range(1, 49)]
+        recent_depths_mm = valid_obs.loc[now_ts - pd.Timedelta(hours=6) : now_ts, "depth_mm"]
+        hourly_statuses = evaluate_alert_hysteresis(
+            base_depth=base_depth,
+            p50_series=p50_hourly,
+            p90_series=p90_hourly,
+            recent_depths_mm=recent_depths_mm,
+        )
+
         forecast_hourly = []
-        for h_step in range(1, 49):
+        for idx_step, h_step in enumerate(range(1, 49)):
             ts_step = now_ts + pd.Timedelta(hours=h_step)
             r_val = (
                 float(fut_wx.loc[ts_step, "rain_p50_mm"])
@@ -1026,7 +766,7 @@ class OFD1ForecastEngine:
                 else 0.0
             )
             prob_val = (
-                int(round(float(fut_wx.loc[ts_step, "precip_prob_pct"])))
+                round(float(fut_wx.loc[ts_step, "precip_prob_pct"]))
                 if ts_step in fut_wx.index and pd.notna(fut_wx.loc[ts_step, "precip_prob_pct"])
                 else 0
             )
@@ -1035,42 +775,11 @@ class OFD1ForecastEngine:
                 if ts_step in ext_feat.index and pd.notna(ext_feat.loc[ts_step, "moisture_index"])
                 else float(now_row.get("moisture_index", 0.5))
             )
-            p50_v = round(float(df_interp.loc[h_step, "p50_mm"]), 1)
-            p90_v = round(float(df_interp.loc[h_step, "p90_mm"]), 1)
+            p50_v = p50_hourly[idx_step]
+            p90_v = p90_hourly[idx_step]
             p90_hydro_v = round(float(df_interp.loc[h_step, "p90_hydro_only_mm"]), 1)
             p10_v = round(float(df_interp.loc[h_step, "p10_mm"]), 1)
-            # Persistence debounce with hysteresis deadband:
-            # - Rising limb requires >= RED_TRIGGER_DEPTH_MM (705 mm) with persistence to avoid edge-touching chatter
-            # - Recession limb remains RED until falling below RED_CLEAR_DEPTH_MM (675 mm)
-            # - Transitional depths (675-705 mm) without multi-hour persistence are held at AMBER
-            is_over_trigger = p50_v >= RED_TRIGGER_DEPTH_MM
-            has_persist = False
-            if is_over_trigger:
-                if base_depth >= AMBER_DEPTH_MM:
-                    has_persist = True
-                else:
-                    prev_p50 = float(df_interp.loc[h_step - 1, "p50_mm"]) if h_step > 1 else base_depth
-                    next_p50 = float(df_interp.loc[h_step + 1, "p50_mm"]) if h_step < 48 else p50_v
-                    has_persist = (prev_p50 >= RED_DEPTH_MM) or (next_p50 >= RED_DEPTH_MM)
-
-            prev_status = (
-                forecast_hourly[-1]["status"]
-                if forecast_hourly
-                else ("RED" if base_depth >= RED_DEPTH_MM else "GREEN")
-            )
-            is_recession_red = (prev_status == "RED") and (p50_v >= RED_CLEAR_DEPTH_MM)
-
-            if (is_over_trigger and has_persist) or is_recession_red:
-                status = "RED"
-            elif (
-                p90_v >= RED_DEPTH_MM
-                or p50_v >= AMBER_DEPTH_MM
-                or is_over_trigger
-                or p50_v >= RED_CLEAR_DEPTH_MM
-            ):
-                status = "AMBER"
-            else:
-                status = "GREEN"
+            status = hourly_statuses[idx_step]
             forecast_hourly.append(
                 {
                     "horizon_h": h_step,
@@ -1184,7 +893,7 @@ class OFD1ForecastEngine:
 
         return {
             "generated_at_utc": self.last_sync_utc
-            or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            or datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "sync_status": self.sync_status,
             "current": {
                 "timestamp": now_ts.isoformat(),
@@ -1337,7 +1046,7 @@ class OFD1ForecastEngine:
             )
 
         df_sim = pd.DataFrame(sim_points).set_index("hour")
-        df_sim_interp = df_sim[["p10_mm", "p50_mm", "p90_mm"]].reindex(range(0, 25)).interpolate("index")
+        df_sim_interp = df_sim[["p10_mm", "p50_mm", "p90_mm"]].reindex(range(25)).interpolate("index")
         curve = [
             {
                 "hour": int(hr),
@@ -1346,7 +1055,7 @@ class OFD1ForecastEngine:
                 "p90_mm": round(float(df_sim_interp.loc[hr, "p90_mm"]), 1),
                 "rain_mm": round(hourly_rain if 1 <= hr <= 6 else 0.0, 2),
             }
-            for hr in range(0, 25)
+            for hr in range(25)
         ]
         peak_p50 = max(c["p50_mm"] for c in curve)
         peak_p90 = max(c["p90_mm"] for c in curve)
@@ -1367,7 +1076,7 @@ class OFD1ForecastEngine:
         df = self._engineer_features(self.df_hourly)
         df["delta_1h"] = df["depth_mm"].diff(1)
 
-        lags = list(range(0, 15))
+        lags = list(range(15))
         ccf_stump = [round(float(df["stump_rain_clean"].corr(df["delta_1h"].shift(-k))), 3) for k in lags]
         ccf_swcc = [round(float(df["swcc_rain_mm"].corr(df["delta_1h"].shift(-k))), 3) for k in lags]
         ccf_ref = [round(float(df["rain_mm"].corr(df["delta_1h"].shift(-k))), 3) for k in lags]
@@ -1425,8 +1134,18 @@ class OFD1ForecastEngine:
             "ablation_metrics": ablation,
         }
 
-    def _ensure_and_update_verification_ledger(self, df_feat: pd.DataFrame) -> None:
+    def _ensure_and_update_verification_ledger(
+        self, df_feat: pd.DataFrame, read_only: bool | None = None
+    ) -> pd.DataFrame:
         """Seed full 2015-2026 verification ledger (tagged train vs out-of-sample test), append live forecasts, and reconcile actual depths."""
+        ro = self.read_only if read_only is None else bool(read_only)
+        if ro and self.ledger_path.exists():
+            df_ledger = pd.read_parquet(self.ledger_path)
+            df_ledger["target_timestamp"] = pd.to_datetime(df_ledger["target_timestamp"], utc=True)
+            df_ledger["issued_at"] = pd.to_datetime(df_ledger["issued_at"], utc=True)
+            self.df_ledger_cached = df_ledger
+            return df_ledger
+
         ledger_horizons = [1, 2, 3, 6, 12, 18, 24, 36, 48]
         valid_obs = df_feat.dropna(subset=["depth_mm"]).sort_index()
 
@@ -1434,11 +1153,7 @@ class OFD1ForecastEngine:
         if not need_seed:
             _existing = pd.read_parquet(self.ledger_path)
             existing_h = set(_existing["horizon_h"].unique())
-            if "train_in_sample" not in _existing["source"].unique():
-                need_seed = True
-            elif pd.to_datetime(_existing["target_timestamp"].min(), utc=True) > valid_obs.index.min() + pd.Timedelta(days=30):
-                need_seed = True
-            elif not set(ledger_horizons).issubset(existing_h):
+            if "train_in_sample" not in _existing["source"].unique() or pd.to_datetime(_existing["target_timestamp"].min(), utc=True) > valid_obs.index.min() + pd.Timedelta(days=30) or not set(ledger_horizons).issubset(existing_h):
                 need_seed = True
 
         if need_seed:
@@ -1493,9 +1208,12 @@ class OFD1ForecastEngine:
                     d_p90=d90,
                 )
 
-                p50 = np.maximum(350.0, base_d + d50_c)
-                p10 = np.maximum(350.0, base_d + np.minimum(d10_c, d50_c))
-                p90 = np.maximum(p50, base_d + np.maximum(d90_c, d50_c))
+                p10, p50, p90 = reconstruct_depth_quantiles(
+                    base_depth=base_d,
+                    d_p10_c=d10_c,
+                    d_p50_c=d50_c,
+                    d_p90_c=d90_c,
+                )
 
                 issued_idx = sub.index
                 target_idx = issued_idx + pd.Timedelta(hours=h)
@@ -1595,9 +1313,12 @@ class OFD1ForecastEngine:
                             d_p90=d90,
                         )
 
-                        p50 = np.maximum(350.0, base_d + d50_c)
-                        p10 = np.maximum(350.0, base_d + np.minimum(d10_c, d50_c))
-                        p90 = np.maximum(p50, base_d + np.maximum(d90_c, d50_c))
+                        p10, p50, p90 = reconstruct_depth_quantiles(
+                            base_depth=base_d,
+                            d_p10_c=d10_c,
+                            d_p50_c=d50_c,
+                            d_p90_c=d90_c,
+                        )
 
                         issued_idx = sub_gap.index
                         target_idx = issued_idx + pd.Timedelta(hours=h)
@@ -1660,7 +1381,10 @@ class OFD1ForecastEngine:
         df_ledger["rain_mm"] = matched_rains.combine_first(df_ledger["rain_mm"]).fillna(0.0)
 
         df_ledger = df_ledger.sort_values(["target_timestamp", "horizon_h"]).reset_index(drop=True)
-        df_ledger.to_parquet(self.ledger_path, index=False)
+        self.df_ledger_cached = df_ledger
+        if not ro:
+            df_ledger.to_parquet(self.ledger_path, index=False)
+        return df_ledger
 
     def get_verification_history(
         self, horizon_h: int = 2, window: str = "recent_14d"
@@ -1670,17 +1394,20 @@ class OFD1ForecastEngine:
         if cache_key in self._verification_cache:
             return self._verification_cache[cache_key]
 
-        if not self.ledger_path.exists():
+        if not self.df_ledger_cached.empty:
+            df_ledger = self.df_ledger_cached.copy()
+        elif self.ledger_path.exists():
+            df_ledger = pd.read_parquet(self.ledger_path)
+            df_ledger["target_timestamp"] = pd.to_datetime(df_ledger["target_timestamp"], utc=True)
+            df_ledger["issued_at"] = pd.to_datetime(df_ledger["issued_at"], utc=True)
+            self.df_ledger_cached = df_ledger
+        else:
             df_feat = (
                 self.df_feat_cached
                 if not self.df_feat_cached.empty
                 else self._engineer_features(self.df_hourly)
             )
-            self._ensure_and_update_verification_ledger(df_feat)
-
-        df_ledger = pd.read_parquet(self.ledger_path)
-        df_ledger["target_timestamp"] = pd.to_datetime(df_ledger["target_timestamp"], utc=True)
-        df_ledger["issued_at"] = pd.to_datetime(df_ledger["issued_at"], utc=True)
+            df_ledger = self._ensure_and_update_verification_ledger(df_feat, read_only=self.read_only)
 
         max_obs_ts = df_ledger.dropna(subset=["actual_depth_mm"])["target_timestamp"].max()
         min_obs_ts = df_ledger.dropna(subset=["actual_depth_mm"])["target_timestamp"].min()
@@ -1731,7 +1458,7 @@ class OFD1ForecastEngine:
                 & (sub_df["actual_depth_mm"] <= sub_df["pred_p90_mm"])
             ).mean() * 100.0
             return {
-                "hours": int(len(sub_df)),
+                "hours": len(sub_df),
                 "start_utc": sub_df["target_timestamp"].min().strftime("%Y-%m-%d %H:%M UTC"),
                 "end_utc": sub_df["target_timestamp"].max().strftime("%Y-%m-%d %H:%M UTC"),
                 "mae_mm": round(mae_v, 1),
@@ -1754,28 +1481,28 @@ class OFD1ForecastEngine:
                     "stream": "OFD1 Streamway Depth (field1)",
                     "start_utc": valid_obs.index.min().strftime("%Y-%m-%d %H:%M UTC"),
                     "end_utc": valid_obs.index.max().strftime("%Y-%m-%d %H:%M UTC"),
-                    "hours": int(len(valid_obs)),
+                    "hours": len(valid_obs),
                     "role": "Target + Autoregressive Lags",
                 },
                 {
                     "stream": "SWCC HQ Rain & Pressure (field2/3)",
                     "start_utc": swcc_obs.index.min().strftime("%Y-%m-%d %H:%M UTC"),
                     "end_utc": swcc_obs.index.max().strftime("%Y-%m-%d %H:%M UTC"),
-                    "hours": int(len(swcc_obs)),
+                    "hours": len(swcc_obs),
                     "role": "Primary Valley Gauge (Offline Nov 4, 2026)",
                 },
                 {
                     "stream": "The Stump Upland Rain & Pressure (field4/5)",
                     "start_utc": stump_obs.index.min().strftime("%Y-%m-%d %H:%M UTC"),
                     "end_utc": stump_obs.index.max().strftime("%Y-%m-%d %H:%M UTC"),
-                    "hours": int(len(stump_obs)),
+                    "hours": len(stump_obs),
                     "role": "Plateau Swallet Gauge (Oct 2–6 Glitch Masked)",
                 },
                 {
                     "stream": "Fan Gyhirych / Dan-yr-Ogof Reanalysis & NWP",
                     "start_utc": valid_obs.index.min().strftime("%Y-%m-%d %H:%M UTC"),
                     "end_utc": valid_obs.index.max().strftime("%Y-%m-%d %H:%M UTC"),
-                    "hours": int(len(valid_obs)),
+                    "hours": len(valid_obs),
                     "role": "Peat Bog Tank + Wind + 48h NWP Forecast",
                 },
             ],
@@ -1924,10 +1651,10 @@ class OFD1ForecastEngine:
             # Empirical quantile position (P10=10%, P50=50%, P90=90%)
             if act_f <= p50_f:
                 denom = max(0.5, p50_f - p10_f)
-                q_pct = int(round(np.clip(50.0 - 40.0 * ((p50_f - act_f) / denom), 1.0, 50.0)))
+                q_pct = round(np.clip(50.0 - 40.0 * ((p50_f - act_f) / denom), 1.0, 50.0))
             else:
                 denom = max(0.5, p90_f - p50_f)
-                q_pct = int(round(np.clip(50.0 + 40.0 * ((act_f - p50_f) / denom), 50.0, 99.0)))
+                q_pct = round(np.clip(50.0 + 40.0 * ((act_f - p50_f) / denom), 50.0, 99.0))
 
             in_b = p10_f <= act_f <= p90_f
             prev_d = r.get("depth_prev_1h")
@@ -1943,7 +1670,7 @@ class OFD1ForecastEngine:
 
             has_pop = pd.notna(r.get("pop_max_6h"))
             has_sp = pd.notna(r.get("nwp_spread_6h"))
-            pop_str = f"{int(round(float(r['pop_max_6h'])))}%" if has_pop else "n/a"
+            pop_str = f"{round(float(r['pop_max_6h']))}%" if has_pop else "n/a"
             nwp_sp_6h = float(r["nwp_spread_6h"]) if has_sp else 0.0
             nwp_lo = float(r["nwp_p10_6h"]) if pd.notna(r.get("nwp_p10_6h")) else grid_6h
             nwp_hi = float(r["nwp_p90_6h"]) if pd.notna(r.get("nwp_p90_6h")) else grid_6h
@@ -2036,7 +1763,7 @@ class OFD1ForecastEngine:
                         "ens_p90_false_alarms": int(e0["p90_red_false_alarms"]),
                         "ens_p90_pod_pct": round(float(e0["p90_red_pod_pct"]), 1),
                     }
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not read ensemble backtest summary: %s", exc)
 
         # Compute aggregate probability & error attribution across verified rows in window
@@ -2073,14 +1800,14 @@ class OFD1ForecastEngine:
                 return round(float(val), ndigits) if pd.notna(val) else None
 
             def _opt_int(val: Any) -> int | None:
-                return int(round(float(val))) if pd.notna(val) else None
+                return round(float(val)) if pd.notna(val) else None
 
             def _bucket_for_tag(tag_str: str) -> tuple[str, str]:
                 if tag_str.startswith("Within P10–P90"):
                     return ("Within P10–P90 Band (Wide Uncertainty)", "#10b981")
                 if tag_str.startswith("Flood-Wall Timing Shift"):
                     return ("Flood-Wall Timing (±1h Phase Shift)", "#f59e0b")
-                if tag_str.startswith("Spatial Rain Divergence") or tag_str.startswith("Peat Sponge"):
+                if tag_str.startswith(("Spatial Rain Divergence", "Peat Sponge")):
                     return ("Local Gauge > Catchment Rain", "#f97316")
                 if tag_str.startswith("Upland Orographic"):
                     return ("Upland Orographic / Snowmelt", "#8b5cf6")
@@ -2184,7 +1911,7 @@ class OFD1ForecastEngine:
                     )
 
             probability_attribution = {
-                "total_verified_hours": int(len(verif_all)),
+                "total_verified_hours": len(verif_all),
                 "deviations_over_20mm": int(n_devs),
                 "captured_by_band_count": cap_exact,
                 "captured_by_band_pct": round(100.0 * cap_exact / n_devs, 1) if n_devs > 0 else 100.0,
@@ -2247,7 +1974,7 @@ class OFD1ForecastEngine:
             p90 = float(r["pred_p90_mm"])
             err_v = round(p50 - act, 1) if act is not None else None
             in_b = bool(p10 <= act <= p90) if act is not None else None
-            pop_v = int(round(float(r["pop_max_6h"]))) if pd.notna(r.get("pop_max_6h")) else None
+            pop_v = round(float(r["pop_max_6h"])) if pd.notna(r.get("pop_max_6h")) else None
             sp_v = round(float(r["nwp_spread_6h"]), 1) if pd.notna(r.get("nwp_spread_6h")) else None
             club_v = float(r["fused_rain_sum_6h"]) if pd.notna(r.get("fused_rain_sum_6h")) else 0.0
             grid_v = float(r["ref_rain_sum_6h"]) if pd.notna(r.get("ref_rain_sum_6h")) else 0.0
@@ -2318,20 +2045,23 @@ class OFD1ForecastEngine:
         """Return the multi-lead forecast evolution (from +48h down to +1h lead) targeting a specific timestamp."""
         try:
             target_ts = pd.to_datetime(target_iso, utc=True).round("1h")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return {"error": f"Invalid target timestamp: {exc}", "target_timestamp": target_iso, "leads": []}
 
-        if not self.ledger_path.exists():
+        if not self.df_ledger_cached.empty:
+            df_ledger = self.df_ledger_cached.copy()
+        elif self.ledger_path.exists():
+            df_ledger = pd.read_parquet(self.ledger_path)
+            df_ledger["target_timestamp"] = pd.to_datetime(df_ledger["target_timestamp"], utc=True)
+            df_ledger["issued_at"] = pd.to_datetime(df_ledger["issued_at"], utc=True)
+            self.df_ledger_cached = df_ledger
+        else:
             df_feat = (
                 self.df_feat_cached
                 if not self.df_feat_cached.empty
                 else self._engineer_features(self.df_hourly)
             )
-            self._ensure_and_update_verification_ledger(df_feat)
-
-        df_ledger = pd.read_parquet(self.ledger_path)
-        df_ledger["target_timestamp"] = pd.to_datetime(df_ledger["target_timestamp"], utc=True)
-        df_ledger["issued_at"] = pd.to_datetime(df_ledger["issued_at"], utc=True)
+            df_ledger = self._ensure_and_update_verification_ledger(df_feat, read_only=self.read_only)
 
         matched = df_ledger[df_ledger["target_timestamp"] == target_ts].sort_values("horizon_h")
         if matched.empty:

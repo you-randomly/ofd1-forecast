@@ -1,0 +1,42 @@
+#!/usr/bin/env sh
+set -eu
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+PYTHON_BIN=".venv/bin/python"
+PYTEST_BIN=".venv/bin/pytest"
+
+if [ ! -x "$PYTHON_BIN" ]; then
+    PYTHON_BIN="uv run python"
+    PYTEST_BIN="uv run pytest"
+fi
+
+STAGED_FILES="$(git diff --cached --name-only || true)"
+NEEDS_SKILL_VERIFY=0
+for f in \
+    "app/hydrology.py" \
+    "app/engine.py" \
+    "scripts/backtest_nwp_ensemble.py" \
+    "data/ofd1_models_v1.joblib" \
+    "data/ofd1_aligned_hourly.parquet" \
+    "data/ofd1_nwp_archive.parquet" \
+    "benchmarks/skill_ledger.json"
+do
+    if printf '%s\n' "$STAGED_FILES" | grep -qx "$f"; then
+        NEEDS_SKILL_VERIFY=1
+        break
+    fi
+done
+
+if [ "$NEEDS_SKILL_VERIFY" -eq 1 ]; then
+    echo "[pre-commit] Verifying 6-file SHA-256 fingerprint and 2026 forecast skill ledger (read-only)..."
+    if ! OFD1_READ_ONLY=1 $PYTHON_BIN scripts/backtest_nwp_ensemble.py --verify-ledger --read-only; then
+        echo "[pre-commit] ERROR: Skill ledger verification failed or fingerprint is out of date." >&2
+        echo "[pre-commit] Run: uv run python scripts/backtest_nwp_ensemble.py --update-ledger" >&2
+        exit 1
+    fi
+fi
+
+echo "[pre-commit] Running offline read-only test suite..."
+OFD1_READ_ONLY=1 $PYTEST_BIN -q

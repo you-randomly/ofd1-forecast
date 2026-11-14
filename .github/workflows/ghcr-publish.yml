@@ -6,6 +6,9 @@ on:
       - main
     tags:
       - "v*.*.*"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -17,7 +20,31 @@ env:
   IMAGE_NAME: you-randomly/ofd1-forecast
 
 jobs:
+  test-and-skill-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python 3.13
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Lint forecasting core and test suite
+        run: uv run ruff check app/hydrology.py app/engine.py app/main.py scripts/backtest_nwp_ensemble.py tests/
+
+      - name: Run offline unit, API contract, and forecast skill regression tests
+        env:
+          OFD1_READ_ONLY: "1"
+        run: uv run pytest -v
+
   build-and-push:
+    needs: test-and-skill-gate
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

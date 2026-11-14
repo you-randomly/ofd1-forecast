@@ -8,38 +8,80 @@ across three issue-time weather scenarios:
   volume-conserved P10/P50/P90 rain trajectories + quadrature-combined P10–P90 band.
 * ``perfect_wx``    – Observed/reanalysis rain (reference upper bound).
 
-Writes ``data/nwp_ensemble_backtest.parquet`` and ``data/nwp_ensemble_backtest_summary.csv``.
+Writes ``data/nwp_ensemble_backtest.parquet`` and ``data/nwp_ensemble_backtest_summary.csv`` when not in
+``--read-only`` mode, and verifies or updates ``benchmarks/skill_ledger.json``.
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
+import json
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from app.engine import (  # noqa: E402
+from app.engine import OFD1ForecastEngine
+from app.hydrology import (
     CAUSAL_COLS,
+    ELEVATED_DEPTH_MM,
+    EVAL_SKILL_HORIZONS,
+    NWP_MODELS,
     RED_DEPTH_MM,
     TRAIN_SPLIT_UTC,
-    OFD1ForecastEngine,
-    nwp_cols_for_horizon,
+    apply_hydrological_guardrails,
+    combine_ensemble_quantile_deltas,
+    compute_nwp_ensemble_quantiles,
+    reconstruct_depth_quantiles,
+    roll_future_features_for_horizon,
 )
 
-MODELS = [
-    "best_match",
-    "ukmo_seamless",
-    "ecmwf_ifs025",
-    "icon_seamless",
-    "gfs_seamless",
-    "meteofrance_seamless",
-]
-EVAL_HORIZONS = [6, 12, 18, 24, 36, 48]
+MODELS = NWP_MODELS
+EVAL_HORIZONS = EVAL_SKILL_HORIZONS
+
+FINGERPRINT_FILES: tuple[str, ...] = (
+    "app/hydrology.py",
+    "app/engine.py",
+    "scripts/backtest_nwp_ensemble.py",
+    "data/ofd1_models_v1.joblib",
+    "data/ofd1_aligned_hourly.parquet",
+    "data/ofd1_nwp_archive.parquet",
+)
+
+DEFAULT_TOLERANCES: dict[str, float] = {
+    "max_mae_regression_mm": 0.5,
+    "max_rmse_regression_mm": 0.75,
+    "min_coverage_80_pct": 66.0,
+    "max_f1_regression": 0.015,
+}
+
+
+def compute_skill_fingerprint(root_dir: Path | str = REPO_ROOT) -> dict[str, Any]:
+    """Compute standalone per-file and composite SHA-256 digests over FINGERPRINT_FILES."""
+    root = Path(root_dir)
+    file_hashes: dict[str, str] = {}
+    composite = hashlib.sha256()
+    for rel_path in FINGERPRINT_FILES:
+        full_path = root / rel_path
+        if not full_path.exists():
+            raise FileNotFoundError(f"Missing required fingerprint file: {full_path}")
+        digest = hashlib.sha256(full_path.read_bytes()).hexdigest()
+        file_hashes[rel_path] = digest
+        composite.update(f"{rel_path}:{digest}\n".encode())
+    return {
+        "fingerprint_sha256": composite.hexdigest(),
+        "files": file_hashes,
+    }
 
 
 def _build_future_rain_trajectories(
@@ -49,7 +91,6 @@ def _build_future_rain_trajectories(
     (det_rain, ens_p10, ens_p50, ens_p90, perf_rain, member_spread_48h)
     """
     n_issues = len(issue_idx)
-    # Build 2D index of timestamps: t0 + 1h .. t0 + 48h
     full_idx = pd.date_range(
         issue_idx.min() + pd.Timedelta(hours=1),
         issue_idx.max() + pd.Timedelta(hours=48),
@@ -59,12 +100,9 @@ def _build_future_rain_trajectories(
     arch_re = arch.reindex(full_idx)
     obs_rain_s = valid_obs["rain_mm"].reindex(full_idx).fillna(0.0).values
 
-    # Map each issue_idx to its starting integer offset in full_idx
     base_offsets = ((issue_idx - full_idx[0]) // pd.Timedelta(hours=1)).values.astype(int)
-    # (N, 48) index grid into full_idx
-    grid_idx = base_offsets[:, None] + np.arange(0, 48, dtype=int)[None, :]
+    grid_idx = base_offsets[:, None] + np.arange(48, dtype=int)[None, :]
 
-    # For each model slug, construct (N, 48) matrix using d0 for lead 1..6, d1 for 7..30, d2 for 31..48
     lead_h = np.arange(1, 49)
     m_d0 = lead_h <= 6
     m_d1 = (lead_h > 6) & (lead_h <= 30)
@@ -81,46 +119,13 @@ def _build_future_rain_trajectories(
         mat[:, m_d2] = c2[grid_idx[:, m_d2]]
         member_mats.append(mat)
 
-    # Stack shape: (M, N, 48)
+    # Stack shape: (M, N, 48) - retain NaNs so compute_nwp_ensemble_quantiles evaluates wet quorum before imputation
     stack = np.stack(member_mats, axis=0)
     det_rain = np.where(np.isnan(stack[0]), np.nanmedian(stack, axis=0), stack[0])
     det_rain = np.nan_to_num(det_rain, nan=0.0)
 
-    # Fill missing member values with det_rain just as _enrich_nwp_ensemble_quantiles does
-    stack_filled = np.where(np.isnan(stack), det_rain[None, :, :], stack)
-
-    ens_min = np.percentile(stack_filled, 10, axis=0)
-    ens_med = np.percentile(stack_filled, 50, axis=0)
-    raw_ens_max = np.percentile(stack_filled, 90, axis=0)
-
-    # 2-model consensus quorum: require >= 2 members predicting rain >= 0.6 mm/h
-    wet_members_count = np.sum(stack_filled >= 0.6, axis=0)
-    ens_max = np.where(
-        wet_members_count >= 2,
-        raw_ens_max,
-        np.minimum(raw_ens_max, 0.5 * (ens_med + raw_ens_max)),
-    )
-
-    rain_p50 = np.round(0.5 * det_rain + 0.5 * ens_med, 2)
-    rain_p10 = np.round(np.minimum(rain_p50, ens_min), 2)
-
-    member_totals_48h = np.sum(stack_filled, axis=2)  # (M, N)
-    high_vol_count = np.sum(member_totals_48h >= 10.0, axis=0)  # (N,)
-    target_p90_raw = np.percentile(member_totals_48h, 90, axis=0)  # (N,)
-    target_p75_raw = np.percentile(member_totals_48h, 75, axis=0)  # (N,)
-    target_p90_total = np.where(high_vol_count >= 2, target_p90_raw, target_p75_raw)
-
-    raw_p90 = np.maximum(rain_p50, ens_max)
-    raw_p90_sum = np.sum(raw_p90, axis=1)  # (N,)
-
-    vol_scale = np.where(
-        (raw_p90_sum > 1e-3) & (target_p90_total > 0.0),
-        np.clip(target_p90_total / np.maximum(raw_p90_sum, 1e-6), 0.55, 1.15),
-        1.0,
-    )
-    rain_p90 = np.round(np.maximum(rain_p50, raw_p90 * vol_scale[:, None]), 2)
+    rain_p10, rain_p50, rain_p90, spread_48h = compute_nwp_ensemble_quantiles(stack, det_rain)
     perf_rain = obs_rain_s[grid_idx]
-    spread_48h = np.max(member_totals_48h, axis=0) - np.min(member_totals_48h, axis=0)
 
     return det_rain, rain_p10, rain_p50, rain_p90, perf_rain, spread_48h
 
@@ -131,57 +136,18 @@ def _roll_future_features_for_horizon(
     fut_rain_mat: np.ndarray,
     h: int,
 ) -> pd.DataFrame:
-    """Compute exact CAUSAL_COLS + nwp_cols_for_horizon(h) at issue_idx for a given (N, 48) future rain matrix."""
-    sub = valid_obs.loc[issue_idx, CAUSAL_COLS].copy()
-    # We need last 11 hours of observed rain before t0 for 6h/12h rolling sums when h < 12
-    full_idx = valid_obs.index
-    base_pos = full_idx.get_indexer(issue_idx)
+    """Delegate future feature rolling to app.hydrology.roll_future_features_for_horizon."""
+    return roll_future_features_for_horizon(valid_obs, issue_idx, fut_rain_mat, h)
 
-    # Gather past 11h of ref_rain (t0-10h .. t0) and eff_rain (t0-5h .. t0)
-    rain_obs_all = valid_obs["rain_mm"].fillna(valid_obs["fused_rain_mm"]).fillna(0.0).values
-    eff_obs_all = valid_obs["eff_rain_mm"].fillna(0.0).values
-    et0_t0 = valid_obs.loc[issue_idx, "et0_mm"].fillna(0.05).values
-    wind_t0 = valid_obs.loc[issue_idx, "wind_kmh"].fillna(15.0).values
-    wind_factor = 1.0 + 0.004 * np.clip(wind_t0 - 15.0, 0.0, None)
-    moist_t0 = valid_obs.loc[issue_idx, "moisture_index"].fillna(0.5).values
 
-    # Roll EWM tanks from t0 to t0 + h
-    ref_tank_6 = valid_obs.loc[issue_idx, "ref_tank_6h"].values.copy()
-    tank_24 = valid_obs.loc[issue_idx, "tank_24h"].values.copy()
-    ref_tank_96 = valid_obs.loc[issue_idx, "ref_tank_96h"].values.copy()
-
-    a6 = 1.0 - np.exp(-np.log(2) / 6.0)
-    a24 = 1.0 - np.exp(-np.log(2) / 24.0)
-    a96 = 1.0 - np.exp(-np.log(2) / 96.0)
-
-    for step in range(h):
-        r_step = fut_rain_mat[:, step]
-        net_step = np.clip(r_step - 0.8 * et0_t0, 0.0, None)
-        ref_tank_6 = (1.0 - a6) * ref_tank_6 + a6 * r_step
-        tank_24 = (1.0 - a24) * tank_24 + a24 * net_step
-        ref_tank_96 = (1.0 - a96) * ref_tank_96 + a96 * r_step
-
-    sub["fut_ref_tank_6h"] = ref_tank_6
-    sub["fut_ref_tank_24h"] = tank_24
-    sub["fut_ref_tank_96h"] = ref_tank_96
-
-    # Build combined rain window [t0-11h .. t0, t0+1h .. t0+h]
-    past_12 = np.column_stack([rain_obs_all[ np.maximum(0, base_pos - k) ] for k in range(11, -1, -1)])
-    comb_rain = np.hstack([past_12, fut_rain_mat[:, :h]])  # index 11 is t0, index 11+h is t0+h
-    tgt_col = 11 + h
-    sub["fut_rain_sum_6h_at_target"] = np.sum(comb_rain[:, tgt_col - 5 : tgt_col + 1], axis=1)
-    sub["fut_rain_sum_12h_at_target"] = np.sum(comb_rain[:, tgt_col - 11 : tgt_col + 1], axis=1)
-
-    fut_eff_mat = (fut_rain_mat[:, :h] * wind_factor[:, None]) * (moist_t0[:, None] ** 1.5)
-    past_6_eff = np.column_stack([eff_obs_all[ np.maximum(0, base_pos - k) ] for k in range(5, -1, -1)])
-    comb_eff = np.hstack([past_6_eff, fut_eff_mat])  # index 5 is t0, index 5+h is t0+h
-    eff_tgt_col = 5 + h
-    sub["fut_eff_rain_sum_6h_at_target"] = np.sum(comb_eff[:, eff_tgt_col - 5 : eff_tgt_col + 1], axis=1)
-
-    for k in range(0, min(h, 6)):
-        sub[f"fut_rain_minus_{k}h_from_target"] = fut_rain_mat[:, h - 1 - k]
-
-    return sub[CAUSAL_COLS + nwp_cols_for_horizon(h)]
+def _binary_f1(pred: pd.Series | np.ndarray, obs: pd.Series | np.ndarray) -> float:
+    pred_b = np.asarray(pred, dtype=bool)
+    obs_b = np.asarray(obs, dtype=bool)
+    tp = int((pred_b & obs_b).sum())
+    fp = int((pred_b & ~obs_b).sum())
+    fn = int((~pred_b & obs_b).sum())
+    denom = 2 * tp + fp + fn
+    return float(2.0 * tp / denom) if denom > 0 else 0.0
 
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
@@ -190,62 +156,116 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     alpha = 0.2
     df["covered"] = (y >= lo) & (y <= hi)
     df["width"] = hi - lo
-    df["abs_err"] = (md - y).abs()
+    df["err"] = md - y
+    df["abs_err"] = df["err"].abs()
+    df["sq_err"] = df["err"] ** 2
     df["interval_score"] = (
         (hi - lo) + (2 / alpha) * (lo - y).clip(lower=0) + (2 / alpha) * (y - hi).clip(lower=0)
     )
+    df["obs_600"] = y >= ELEVATED_DEPTH_MM
+    df["p90_600"] = hi >= ELEVATED_DEPTH_MM
+    df["p50_600"] = md >= ELEVATED_DEPTH_MM
     df["obs_red"] = y >= RED_DEPTH_MM
     df["p90_red"] = hi >= RED_DEPTH_MM
     df["p50_red"] = md >= RED_DEPTH_MM
 
     def _agg(g: pd.DataFrame) -> pd.Series:
-        obs = g["obs_red"]
+        obs_red = g["obs_red"]
+        obs_600 = g["obs_600"]
         wet = g[g["member_rain_48h_spread_mm"] >= 2.0]
-        out = {
+        out: dict[str, Any] = {
             "n": len(g),
             "coverage_pct": 100 * g["covered"].mean(),
             "wet_coverage_pct": 100 * wet["covered"].mean() if len(wet) else np.nan,
             "mean_width_mm": g["width"].mean(),
             "wet_width_mm": wet["width"].mean() if len(wet) else np.nan,
             "mae_p50_mm": g["abs_err"].mean(),
+            "rmse_p50_mm": float(np.sqrt(g["sq_err"].mean())),
             "interval_score": g["interval_score"].mean(),
-            "obs_red_hours": int(obs.sum()),
+            "obs_red_hours": int(obs_red.sum()),
         }
         for q in ("p90", "p50"):
             pred = g[f"{q}_red"]
-            hits = int((pred & obs).sum())
-            fa = int((pred & ~obs).sum())
-            miss = int((~pred & obs).sum())
+            hits = int((pred & obs_red).sum())
+            fa = int((pred & ~obs_red).sum())
+            miss = int((~pred & obs_red).sum())
             out[f"{q}_red_pod_pct"] = 100 * hits / max(1, hits + miss)
             out[f"{q}_red_far_pct"] = 100 * fa / max(1, hits + fa)
             out[f"{q}_red_false_alarms"] = fa
             out[f"{q}_red_misses"] = miss
+
+        out["f1_600_p50"] = _binary_f1(g["p50_600"], obs_600)
+        out["f1_600_p90"] = _binary_f1(g["p90_600"], obs_600)
+        out["f1_700_p50"] = _binary_f1(g["p50_red"], obs_red)
+        out["f1_700_p90"] = _binary_f1(g["p90_red"], obs_red)
         return pd.Series(out)
 
     summ = df.groupby(["horizon_h", "scenario"]).apply(_agg, include_groups=False).reset_index()
-    return summ.round(2)
+    f1_cols = ["f1_600_p50", "f1_600_p90", "f1_700_p50", "f1_700_p90"]
+    other_float_cols = [
+        c for c in summ.select_dtypes(include=[np.floating, float]).columns if c not in f1_cols
+    ]
+    summ[other_float_cols] = summ[other_float_cols].round(2)
+    summ[f1_cols] = summ[f1_cols].round(4)
+    for int_col in (
+        "n",
+        "obs_red_hours",
+        "p90_red_false_alarms",
+        "p90_red_misses",
+        "p50_red_false_alarms",
+        "p50_red_misses",
+    ):
+        if int_col in summ.columns:
+            summ[int_col] = summ[int_col].astype(int)
+    return summ
 
 
-def main() -> None:
-    t0 = time.time()
-    eng = OFD1ForecastEngine(data_dir="data")
+def run_backtest(
+    data_dir: Path | str = "data",
+    read_only: bool = False,
+    horizons: list[int] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run vectorized 2026 out-of-sample backtest across horizons and scenarios."""
+    d_dir = Path(data_dir)
+    eval_h = horizons if horizons is not None else EVAL_HORIZONS
+
+    eng = OFD1ForecastEngine(data_dir=d_dir, read_only=True)
     eng.df_hourly = pd.read_parquet(eng.aligned_1h_path).sort_index()
     eng.models = joblib.load(eng.models_path)
     df_feat = eng._engineer_features(eng.df_hourly)
     valid_obs = df_feat.dropna(subset=["depth_mm"] + CAUSAL_COLS).sort_index()
-    arch = pd.read_parquet(Path("data/ofd1_nwp_archive.parquet")).sort_index()
+    arch = pd.read_parquet(d_dir / "ofd1_nwp_archive.parquet").sort_index()
 
     end_ts = min(valid_obs.index.max(), arch.index.max()) - pd.Timedelta(hours=48)
     issue_idx = valid_obs.loc[TRAIN_SPLIT_UTC:end_ts].index
-    print(f"Vectorized backtest over {len(issue_idx)} hourly 2026 issue times ({issue_idx[0]} → {issue_idx[-1]})")
 
     det_r, p10_r, p50_r, p90_r, perf_r, spread_48h = _build_future_rain_trajectories(
         arch, valid_obs, issue_idx
     )
     base_d = valid_obs.loc[issue_idx, "depth_mm"].values
+    fused_3h = (
+        valid_obs.loc[issue_idx, "fused_rain_sum_3h"].values
+        if "fused_rain_sum_3h" in valid_obs.columns
+        else np.zeros(len(issue_idx))
+    )
+    moist_idx = (
+        valid_obs.loc[issue_idx, "moisture_index"].values
+        if "moisture_index" in valid_obs.columns
+        else np.full(len(issue_idx), 0.5)
+    )
+    t_168 = (
+        valid_obs.loc[issue_idx, "tank_168h"].values
+        if "tank_168h" in valid_obs.columns
+        else np.full(len(issue_idx), 0.5)
+    )
+    dd_1h = (
+        valid_obs.loc[issue_idx, "ddepth_1h"].values
+        if "ddepth_1h" in valid_obs.columns
+        else np.zeros(len(issue_idx))
+    )
 
     chunks = []
-    for h in EVAL_HORIZONS:
+    for h in eval_h:
         X_det = _roll_future_features_for_horizon(valid_obs, issue_idx, det_r, h)
         X_p10 = _roll_future_features_for_horizon(valid_obs, issue_idx, p10_r, h)
         X_p50 = _roll_future_features_for_horizon(valid_obs, issue_idx, p50_r, h)
@@ -256,81 +276,86 @@ def main() -> None:
         target_idx = issue_idx + pd.Timedelta(hours=h)
         act_d = valid_obs["depth_mm"].reindex(target_idx).values
 
-        # 1. Deterministic NWP (hydrological P10-P90 only)
+        # 1. Deterministic NWP (hydrological P10-P90 with physical guardrails)
         d50_det = m["p50"].predict(X_det)
         d10_det = m["p10"].predict(X_det)
         d90_det = m["p90"].predict(X_det)
-        p50_det = np.maximum(350.0, base_d + d50_det)
-        p10_det = np.maximum(350.0, np.minimum(p50_det, base_d + d10_det))
-        p90_det = np.maximum(p50_det, base_d + d90_det)
-
-        # 2. 6-Model NWP Ensemble (quadrature combination matching _forecast_anchors)
-        d_p50 = m["p50"].predict(X_p50)
-        d_p10_on_p10 = m["p10"].predict(X_p10)
-        d_p50_on_p10 = m["p50"].predict(X_p10)
-        delta_hydro_low = np.maximum(0.0, d_p50 - m["p10"].predict(X_p50))
-        delta_nwp_low = np.maximum(0.0, d_p50 - d_p50_on_p10)
-        total_low = np.sqrt(delta_hydro_low**2 + delta_nwp_low**2)
-
-        d_p90_on_p50 = m["p90"].predict(X_p50)
-        d_p90_on_p90 = m["p90"].predict(X_p90)
-        d_p50_on_p90 = m["p50"].predict(X_p90)
-        delta_hydro_high = np.maximum(0.0, d_p90_on_p50 - d_p50)
-        delta_nwp_high = np.maximum(
-            0.0, np.maximum(d_p50_on_p90 - d_p50, 0.35 * (d_p90_on_p90 - d_p90_on_p50))
-        )
-        total_high = np.sqrt(delta_hydro_high**2 + delta_nwp_high**2)
-
-        fused_3h = (
-            valid_obs.loc[issue_idx, "fused_rain_sum_3h"].values
-            if "fused_rain_sum_3h" in valid_obs.columns
-            else np.zeros(len(issue_idx))
-        )
-        fut_sum = (
-            X_p50["fut_rain_sum_6h_at_target"].values
-            if "fut_rain_sum_6h_at_target" in X_p50.columns
-            else np.zeros(len(issue_idx))
-        )
-        moist_idx = (
-            valid_obs.loc[issue_idx, "moisture_index"].values
-            if "moisture_index" in valid_obs.columns
-            else np.full(len(issue_idx), 0.5)
-        )
-        t_168 = (
-            valid_obs.loc[issue_idx, "tank_168h"].values
-            if "tank_168h" in valid_obs.columns
-            else np.full(len(issue_idx), 0.5)
-        )
-        dd_1h = (
-            valid_obs.loc[issue_idx, "ddepth_1h"].values
-            if "ddepth_1h" in valid_obs.columns
-            else np.zeros(len(issue_idx))
-        )
-
-        d10_c, d50_c, d90_c = eng._apply_hydrological_guardrails(
+        d10_det_c, d50_det_c, d90_det_c = apply_hydrological_guardrails(
             base_depth=base_d,
             ddepth_1h=dd_1h,
             fused_rain_3h=fused_3h,
             moisture_index=moist_idx,
             tank_168h=t_168,
             horizon_h=h,
-            fut_rain_sum=fut_sum,
-            d_p10=-total_low,
-            d_p50=d_p50,
-            d_p90=d_p50 + total_high,
+            fut_rain_sum=X_det["fut_rain_sum_6h_at_target"].values,
+            d_p10=d10_det,
+            d_p50=d50_det,
+            d_p90=d90_det,
+        )
+        p10_det, p50_det, p90_det = reconstruct_depth_quantiles(
+            base_depth=base_d,
+            d_p10_c=d10_det_c,
+            d_p50_c=d50_det_c,
+            d_p90_c=d90_det_c,
         )
 
-        p50_ens = np.maximum(350.0, base_d + d50_c)
-        p10_ens = np.maximum(350.0, base_d + np.minimum(d10_c, d50_c))
-        p90_ens = np.maximum(p50_ens, base_d + d90_c)
+        # 2. 6-Model NWP Ensemble (quadrature combination + physical guardrails matching _forecast_anchors)
+        d_p50 = m["p50"].predict(X_p50)
+        d_p10_on_p50 = m["p10"].predict(X_p50)
+        d_p50_on_p10 = m["p50"].predict(X_p10)
+        d_p90_on_p50 = m["p90"].predict(X_p50)
+        d_p90_on_p90 = m["p90"].predict(X_p90)
+        d_p50_on_p90 = m["p50"].predict(X_p90)
 
-        # 3. Perfect Wx reference
+        d10_rel, d50_rel, d90_rel, _ = combine_ensemble_quantile_deltas(
+            d_p50=d_p50,
+            d_p10_on_p50=d_p10_on_p50,
+            d_p50_on_p10=d_p50_on_p10,
+            d_p90_on_p50=d_p90_on_p50,
+            d_p90_on_p90=d_p90_on_p90,
+            d_p50_on_p90=d_p50_on_p90,
+        )
+        d10_ens_c, d50_ens_c, d90_ens_c = apply_hydrological_guardrails(
+            base_depth=base_d,
+            ddepth_1h=dd_1h,
+            fused_rain_3h=fused_3h,
+            moisture_index=moist_idx,
+            tank_168h=t_168,
+            horizon_h=h,
+            fut_rain_sum=X_p50["fut_rain_sum_6h_at_target"].values,
+            d_p10=d10_rel,
+            d_p50=d50_rel,
+            d_p90=d90_rel,
+        )
+        p10_ens, p50_ens, p90_ens = reconstruct_depth_quantiles(
+            base_depth=base_d,
+            d_p10_c=d10_ens_c,
+            d_p50_c=d50_ens_c,
+            d_p90_c=d90_ens_c,
+        )
+
+        # 3. Perfect Wx reference (with physical guardrails)
         d50_pf = m["p50"].predict(X_perf)
         d10_pf = m["p10"].predict(X_perf)
         d90_pf = m["p90"].predict(X_perf)
-        p50_pf = np.maximum(350.0, base_d + d50_pf)
-        p10_pf = np.maximum(350.0, np.minimum(p50_pf, base_d + d10_pf))
-        p90_pf = np.maximum(p50_pf, base_d + d90_pf)
+        d10_pf_c, d50_pf_c, d90_pf_c = apply_hydrological_guardrails(
+            base_depth=base_d,
+            ddepth_1h=dd_1h,
+            fused_rain_3h=fused_3h,
+            moisture_index=moist_idx,
+            tank_168h=t_168,
+            horizon_h=h,
+            fut_rain_sum=X_perf["fut_rain_sum_6h_at_target"].values,
+            d_p10=d10_pf,
+            d_p50=d50_pf,
+            d_p90=d90_pf,
+        )
+        p10_pf, p50_pf, p90_pf = reconstruct_depth_quantiles(
+            base_depth=base_d,
+            d_p10_c=d10_pf_c,
+            d_p50_c=d50_pf_c,
+            d_p90_c=d90_pf_c,
+        )
 
         for scen, lo, md, hi in [
             ("deterministic", p10_det, p50_det, p90_det),
@@ -355,14 +380,200 @@ def main() -> None:
             )
 
     df_all = pd.concat(chunks, ignore_index=True)
-    out = Path("data/nwp_ensemble_backtest.parquet")
-    df_all.to_parquet(out, index=False)
     summ = summarize(df_all)
-    summ.to_csv(Path("data/nwp_ensemble_backtest_summary.csv"), index=False)
+
+    if not read_only:
+        df_all.to_parquet(d_dir / "nwp_ensemble_backtest.parquet", index=False)
+        summ.to_csv(d_dir / "nwp_ensemble_backtest_summary.csv", index=False)
+
+    return df_all, summ
+
+
+def _extract_ledger_metrics(summary_df: pd.DataFrame) -> dict[str, dict[str, dict[str, float]]]:
+    metrics: dict[str, dict[str, dict[str, float]]] = {"ensemble": {}, "deterministic": {}}
+    metric_cols = [
+        "mae_p50_mm",
+        "rmse_p50_mm",
+        "coverage_pct",
+        "f1_600_p50",
+        "f1_600_p90",
+        "f1_700_p50",
+        "f1_700_p90",
+    ]
+    for scen in ("ensemble", "deterministic"):
+        sub = summary_df[summary_df["scenario"] == scen]
+        for _, row in sub.iterrows():
+            h_key = str(int(row["horizon_h"]))
+            metrics[scen][h_key] = {col: float(row[col]) for col in metric_cols}
+    return metrics
+
+
+def verify_or_update_skill_ledger(
+    summary_df: pd.DataFrame,
+    ledger_path: Path = REPO_ROOT / "benchmarks" / "skill_ledger.json",
+    root_dir: Path = REPO_ROOT,
+    update: bool = False,
+    reset_baseline: bool = False,
+) -> dict[str, Any]:
+    """Validate summary_df against benchmarks/skill_ledger.json or update the ledger."""
+    fp = compute_skill_fingerprint(root_dir)
+    current_metrics = _extract_ledger_metrics(summary_df)
+
+    existing: dict[str, Any] | None = None
+    if ledger_path.exists():
+        existing = json.loads(ledger_path.read_text(encoding="utf-8"))
+
+    if existing is not None and not reset_baseline:
+        if not update and existing.get("current_fingerprint_sha256") != fp["fingerprint_sha256"]:
+            raise AssertionError(
+                f"Skill ledger fingerprint mismatch: ledger has {existing.get('current_fingerprint_sha256')}, "
+                f"live workspace has {fp['fingerprint_sha256']}. "
+                "Run `uv run python scripts/backtest_nwp_ensemble.py --update-ledger`."
+            )
+        tolerances = existing.get("tolerances", DEFAULT_TOLERANCES)
+        baseline = existing.get("baseline_metrics", {})
+        failures: list[str] = []
+        for scen in ("ensemble", "deterministic"):
+            base_scen = baseline.get(scen, {})
+            curr_scen = current_metrics.get(scen, {})
+            for h_key, b_vals in base_scen.items():
+                if h_key not in curr_scen:
+                    failures.append(f"Missing horizon +{h_key}h for scenario '{scen}'")
+                    continue
+                c_vals = curr_scen[h_key]
+                if c_vals["mae_p50_mm"] > b_vals["mae_p50_mm"] + tolerances["max_mae_regression_mm"]:
+                    failures.append(
+                        f"{scen} +{h_key}h MAE regressed: {c_vals['mae_p50_mm']:.2f} > "
+                        f"{b_vals['mae_p50_mm']:.2f} + {tolerances['max_mae_regression_mm']}"
+                    )
+                if c_vals["rmse_p50_mm"] > b_vals["rmse_p50_mm"] + tolerances["max_rmse_regression_mm"]:
+                    failures.append(
+                        f"{scen} +{h_key}h RMSE regressed: {c_vals['rmse_p50_mm']:.2f} > "
+                        f"{b_vals['rmse_p50_mm']:.2f} + {tolerances['max_rmse_regression_mm']}"
+                    )
+                min_cov = max(float(tolerances["min_coverage_80_pct"]), b_vals["coverage_pct"] - 1.5)
+                if scen == "ensemble" and c_vals["coverage_pct"] < min_cov:
+                    failures.append(
+                        f"{scen} +{h_key}h coverage regressed: {c_vals['coverage_pct']:.2f}% < {min_cov:.2f}%"
+                    )
+                if c_vals["f1_600_p50"] < b_vals["f1_600_p50"] - tolerances["max_f1_regression"]:
+                    failures.append(
+                        f"{scen} +{h_key}h F1@600(P50) regressed: {c_vals['f1_600_p50']:.4f} < "
+                        f"{b_vals['f1_600_p50']:.4f} - {tolerances['max_f1_regression']}"
+                    )
+                if c_vals["f1_700_p90"] < b_vals["f1_700_p90"] - tolerances["max_f1_regression"]:
+                    failures.append(
+                        f"{scen} +{h_key}h F1@700(P90) regressed: {c_vals['f1_700_p90']:.4f} < "
+                        f"{b_vals['f1_700_p90']:.4f} - {tolerances['max_f1_regression']}"
+                    )
+        if failures:
+            raise AssertionError("Forecast skill regression gate failed:\n  - " + "\n  - ".join(failures))
+    elif not update:
+        raise FileNotFoundError(
+            f"Skill ledger not found at {ledger_path}. Run with --update-ledger to initialize."
+        )
+
+    if update:
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        baseline_to_save = (
+            current_metrics
+            if (existing is None or reset_baseline)
+            else existing.get("baseline_metrics", current_metrics)
+        )
+        tolerances_to_save = (
+            DEFAULT_TOLERANCES
+            if (existing is None or reset_baseline)
+            else existing.get("tolerances", DEFAULT_TOLERANCES)
+        )
+        history = list(existing.get("history", [])) if existing is not None else []
+        # Avoid duplicate consecutive history entries for the identical fingerprint
+        if not history or history[-1].get("fingerprint_sha256") != fp["fingerprint_sha256"]:
+            history.append(
+                {
+                    "timestamp_utc": now_iso,
+                    "fingerprint_sha256": fp["fingerprint_sha256"],
+                    "ensemble_metrics": current_metrics["ensemble"],
+                }
+            )
+        else:
+            history[-1] = {
+                "timestamp_utc": now_iso,
+                "fingerprint_sha256": fp["fingerprint_sha256"],
+                "ensemble_metrics": current_metrics["ensemble"],
+            }
+
+        payload = {
+            "schema_version": 1,
+            "generated_at_utc": now_iso,
+            "current_fingerprint_sha256": fp["fingerprint_sha256"],
+            "files": fp["files"],
+            "horizons_evaluated": EVAL_HORIZONS,
+            "tolerances": tolerances_to_save,
+            "baseline_metrics": baseline_to_save,
+            "current_metrics": current_metrics,
+            "history": history[-20:],
+        }
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return payload
+
+    return existing or {}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OFD1 2026 Out-of-Sample NWP Ensemble Backtest & Skill Gate")
+    parser.add_argument("--data-dir", default="data", help="Path to telemetry/model data directory")
+    parser.add_argument("--read-only", action="store_true", help="Do not write Parquet/CSV files to data/")
+    parser.add_argument(
+        "--verify-ledger",
+        action="store_true",
+        help="Verify SHA-256 fingerprint and non-regression against benchmarks/skill_ledger.json",
+    )
+    parser.add_argument(
+        "--update-ledger",
+        action="store_true",
+        help="Update benchmarks/skill_ledger.json with current fingerprint and metrics",
+    )
+    parser.add_argument(
+        "--reset-baseline",
+        action="store_true",
+        help="Reset baseline_metrics in benchmarks/skill_ledger.json when used with --update-ledger",
+    )
+    args = parser.parse_args()
+
+    t0 = time.time()
+    data_dir = Path(args.data_dir)
+    summary_csv_path = data_dir / "nwp_ensemble_backtest_summary.csv"
+
+    # Fast path for --verify-ledger --read-only when summary CSV already exists and fingerprint matches
+    if args.verify_ledger and args.read_only and not args.update_ledger and summary_csv_path.exists():
+        summ = pd.read_csv(summary_csv_path)
+        expected_cols = {"rmse_p50_mm", "f1_600_p50", "f1_600_p90", "f1_700_p50", "f1_700_p90"}
+        if expected_cols.issubset(set(summ.columns)) and set(EVAL_HORIZONS).issubset(
+            set(summ["horizon_h"].astype(int).unique())
+        ):
+            verify_or_update_skill_ledger(summ, update=False, reset_baseline=False)
+            print(
+                f"Verified skill ledger and 6-file SHA-256 fingerprint against {summary_csv_path} in {time.time() - t0:.2f}s"
+            )
+            return
+
+    _, summ = run_backtest(data_dir=data_dir, read_only=args.read_only)
     pd.set_option("display.width", 240)
     pd.set_option("display.max_columns", 30)
     print(summ.to_string(index=False))
-    print(f"Completed full 2026 hourly backtest in {time.time() - t0:.1f}s → {out}")
+    print(f"Completed full 2026 hourly backtest in {time.time() - t0:.1f}s")
+
+    if args.verify_ledger or args.update_ledger:
+        verify_or_update_skill_ledger(
+            summ,
+            update=args.update_ledger,
+            reset_baseline=args.reset_baseline,
+        )
+        if args.update_ledger:
+            print("Updated benchmarks/skill_ledger.json")
+        else:
+            print("Verified benchmarks/skill_ledger.json")
 
 
 if __name__ == "__main__":
