@@ -25,6 +25,9 @@ def test_health_endpoints(api_client: TestClient) -> None:
         assert body["status"] == "ok"
         assert body["sync_status"] == "ready"
         assert sorted(body["horizons_loaded"]) == HORIZONS
+        assert "rain_source_active" in body
+        assert "source_health" in body
+        assert "nrw" in body["source_health"]
     assert engine.read_only is True
 
 
@@ -69,6 +72,7 @@ def test_dashboard_and_v1_status_forecast_history(api_client: TestClient) -> Non
     assert status_body["status"] == "ok"
     assert status_body["current"]["depth_mm"] == dash["current"]["depth_mm"]
     assert "depth_sensor" in status_body["gauges"]
+    assert "nrw_gauge" in status_body["gauges"]
 
     fc_resp = api_client.get("/api/v1/forecast")
     assert fc_resp.status_code == 200
@@ -125,3 +129,18 @@ def test_verification_and_nwp_backtest_endpoints(api_client: TestClient) -> None
     assert "horizons" in bt_body
     assert "records" in bt_body
     assert len(bt_body["records"]) > 0
+
+
+def test_model_version_selection(monkeypatch) -> None:
+    """Verify OFD1_MODEL_VERSION selects v2 by default and supports v1 rollback."""
+    from app.engine import OFD1ForecastEngine
+
+    monkeypatch.delenv("OFD1_MODEL_VERSION", raising=False)
+    eng_default = OFD1ForecastEngine(data_dir="data", read_only=True)
+    assert eng_default.model_version == "v2"
+    assert eng_default.models_path.name == "ofd1_models_v2.joblib"
+
+    monkeypatch.setenv("OFD1_MODEL_VERSION", "v1")
+    eng_v1 = OFD1ForecastEngine(data_dir="data", read_only=True)
+    assert eng_v1.model_version == "v1"
+    assert eng_v1.models_path.name == "ofd1_models_v1.joblib"

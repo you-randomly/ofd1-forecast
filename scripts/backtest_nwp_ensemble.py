@@ -40,8 +40,8 @@ from app.hydrology import (
     RED_DEPTH_MM,
     TRAIN_SPLIT_UTC,
     apply_hydrological_guardrails,
+    build_archived_nwp_trajectories,
     combine_ensemble_quantile_deltas,
-    compute_nwp_ensemble_quantiles,
     reconstruct_depth_quantiles,
     roll_future_features_for_horizon,
 )
@@ -53,7 +53,7 @@ FINGERPRINT_FILES: tuple[str, ...] = (
     "app/hydrology.py",
     "app/engine.py",
     "scripts/backtest_nwp_ensemble.py",
-    "data/ofd1_models_v1.joblib",
+    "data/ofd1_models_v2.joblib",
     "data/ofd1_aligned_hourly.parquet",
     "data/ofd1_nwp_archive.parquet",
 )
@@ -87,47 +87,8 @@ def compute_skill_fingerprint(root_dir: Path | str = REPO_ROOT) -> dict[str, Any
 def _build_future_rain_trajectories(
     arch: pd.DataFrame, valid_obs: pd.DataFrame, issue_idx: pd.DatetimeIndex
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (N, 48) matrices of future hourly rain for:
-    (det_rain, ens_p10, ens_p50, ens_p90, perf_rain, member_spread_48h)
-    """
-    n_issues = len(issue_idx)
-    full_idx = pd.date_range(
-        issue_idx.min() + pd.Timedelta(hours=1),
-        issue_idx.max() + pd.Timedelta(hours=48),
-        freq="1h",
-        tz="UTC",
-    )
-    arch_re = arch.reindex(full_idx)
-    obs_rain_s = valid_obs["rain_mm"].reindex(full_idx).fillna(0.0).values
-
-    base_offsets = ((issue_idx - full_idx[0]) // pd.Timedelta(hours=1)).values.astype(int)
-    grid_idx = base_offsets[:, None] + np.arange(48, dtype=int)[None, :]
-
-    lead_h = np.arange(1, 49)
-    m_d0 = lead_h <= 6
-    m_d1 = (lead_h > 6) & (lead_h <= 30)
-    m_d2 = lead_h > 30
-
-    member_mats = []
-    for slug in MODELS:
-        c0 = arch_re[f"{slug}_d0"].values if f"{slug}_d0" in arch_re else np.full(len(full_idx), np.nan)
-        c1 = arch_re[f"{slug}_d1"].values if f"{slug}_d1" in arch_re else np.full(len(full_idx), np.nan)
-        c2 = arch_re[f"{slug}_d2"].values if f"{slug}_d2" in arch_re else np.full(len(full_idx), np.nan)
-        mat = np.empty((n_issues, 48), dtype=float)
-        mat[:, m_d0] = c0[grid_idx[:, m_d0]]
-        mat[:, m_d1] = c1[grid_idx[:, m_d1]]
-        mat[:, m_d2] = c2[grid_idx[:, m_d2]]
-        member_mats.append(mat)
-
-    # Stack shape: (M, N, 48) - retain NaNs so compute_nwp_ensemble_quantiles evaluates wet quorum before imputation
-    stack = np.stack(member_mats, axis=0)
-    det_rain = np.where(np.isnan(stack[0]), np.nanmedian(stack, axis=0), stack[0])
-    det_rain = np.nan_to_num(det_rain, nan=0.0)
-
-    rain_p10, rain_p50, rain_p90, spread_48h = compute_nwp_ensemble_quantiles(stack, det_rain)
-    perf_rain = obs_rain_s[grid_idx]
-
-    return det_rain, rain_p10, rain_p50, rain_p90, perf_rain, spread_48h
+    """Delegate archived NWP trajectory construction to app.hydrology.build_archived_nwp_trajectories."""
+    return build_archived_nwp_trajectories(arch, valid_obs, issue_idx)
 
 
 def _roll_future_features_for_horizon(

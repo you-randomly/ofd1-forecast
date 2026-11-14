@@ -7,6 +7,26 @@ kind: Namespace
 metadata:
   name: ofd1-forecast
 ---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: ofd1-nrw-api
+  namespace: ofd1-forecast
+  labels:
+    app: ofd1-forecast
+spec:
+  refreshInterval: 10s
+  secretStoreRef:
+    name: bitwarden-secretsmanager
+    kind: ClusterSecretStore
+  target:
+    name: ofd1-nrw-api
+    creationPolicy: Owner
+  data:
+    - secretKey: NRW_API_KEY
+      remoteRef:
+        key: "b4b3dabe-c8b2-4425-9696-b50201283749"
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -67,6 +87,14 @@ spec:
               value: "/app/seed_data"
             - name: OFD1_REFRESH_SECONDS
               value: "600"
+            - name: OFD1_MODEL_VERSION
+              value: "v2"
+            - name: NRW_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ofd1-nrw-api
+                  key: NRW_API_KEY
+                  optional: false
           resources:
             requests:
               cpu: 100m

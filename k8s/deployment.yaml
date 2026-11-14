@@ -42,6 +42,14 @@ spec:
               value: "/app/seed_data"
             - name: OFD1_REFRESH_SECONDS
               value: "600"
+            - name: OFD1_MODEL_VERSION
+              value: "v2"
+            - name: NRW_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ofd1-nrw-api
+                  key: NRW_API_KEY
+                  optional: false
           resources:
             requests:
               cpu: 100m

@@ -80,6 +80,8 @@ async def health() -> dict[str, Any]:
         "sync_status": engine.sync_status,
         "last_sync_utc": engine.last_sync_utc,
         "horizons_loaded": list(engine.models.keys()),
+        "rain_source_active": engine.latest_payload.get("rain_source_active", "unknown"),
+        "source_health": engine.source_health,
     }
 
 
@@ -94,6 +96,8 @@ async def get_v1_status() -> dict[str, Any]:
         "status": "ok",
         "sync_status": engine.sync_status,
         "generated_at_utc": engine.latest_payload.get("generated_at_utc"),
+        "rain_source_active": engine.latest_payload.get("rain_source_active", "unknown"),
+        "source_health": engine.source_health,
         "current": engine.latest_payload.get("current", {}),
         "gauges": engine.latest_payload.get("gauges", {}),
     }

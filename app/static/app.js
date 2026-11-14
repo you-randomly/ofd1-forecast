@@ -70,8 +70,14 @@ function updateSummaryCards(data) {
     c.max_nwp_lift_48h_mm && c.max_nwp_lift_48h_mm > 0
       ? ` • 48h Crest: ${c.max_p50_48h_mm} / ${c.max_p90_48h_mm} mm (+${c.max_nwp_lift_48h_mm} mm NWP Ensemble Lift)`
       : "";
+  const obsRainNote =
+    data.rain_source_active === "open_meteo"
+      ? " • OBSERVED RAIN UNAVAILABLE (Weather-model fallback active)"
+      : data.rain_source_active === "nrw"
+        ? " • NRW TELEMETRY FALLBACK ACTIVE (Local club gauges offline/quarantined)"
+        : "";
   document.getElementById("alert-subtext").textContent =
-    `Latest sensor reading at ${c.timestamp.slice(0, 16).replace("T", " ")} UTC • 24h Forecast Crest: ${c.max_p50_24h_mm} mm (P50) / ${c.max_p90_24h_mm} mm (P90)${nwpLiftNote}`;
+    `Latest sensor reading at ${c.timestamp.slice(0, 16).replace("T", " ")} UTC • 24h Forecast Crest: ${c.max_p50_24h_mm} mm (P50) / ${c.max_p90_24h_mm} mm (P90)${nwpLiftNote}${obsRainNote}`;
   document.getElementById("countdown-label").textContent = c.countdown_label;
   document.getElementById("countdown-value").textContent = c.countdown_value;
 
@@ -300,7 +306,7 @@ function renderGaugeStatus(gauges, nwpEnsemble) {
   const container = document.getElementById("gauge-status-list");
   container.innerHTML = "";
 
-  for (const key of ["depth_sensor", "stump_gauge", "swcc_gauge", "nwp_ensemble"]) {
+  for (const key of ["depth_sensor", "stump_gauge", "swcc_gauge", "nrw_gauge", "nwp_ensemble"]) {
     const g = gauges[key];
     if (!g) continue;
     const isOnline = g.status.startsWith("ONLINE");
@@ -442,8 +448,14 @@ function renderVerification(verif) {
     `${m.mae_mm ?? "—"} mm (${m.mae_inches ?? "—"}")`;
   document.getElementById("verif-kpi-rmse").textContent = `RMSE: ${m.rmse_mm ?? "—"} mm`;
   document.getElementById("verif-kpi-nse").textContent = `${m.nse ?? "—"}`;
+  const skillVal = m.skill_vs_pers_pct;
+  const skillSign = skillVal != null && skillVal >= 0 ? "+" : "";
+  const dryNote =
+    skillVal != null && skillVal < 0 && (m.mae_mm ?? 999) < 15
+      ? " (low-variance dry window)"
+      : "";
   document.getElementById("verif-kpi-skill").textContent =
-    `Skill vs. Naive Persistence: +${m.skill_vs_pers_pct ?? "—"}%`;
+    `Skill vs. Naive Persistence: ${skillSign}${skillVal ?? "—"}%${dryNote}`;
   document.getElementById("verif-kpi-count-tag").textContent =
     `${m.verified_hours ?? 0} verified hrs`;
   document.getElementById("verif-kpi-cov").textContent = `${m.band_coverage_pct ?? "—"}%`;

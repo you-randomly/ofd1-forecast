@@ -282,3 +282,193 @@ def test_alert_hysteresis_rising_falling_and_t0_recession() -> None:
     # Contrast with rising limb at 685 mm that has NOT yet reached 700 mm
     recent_rising = [560.0, 610.0, 645.0, 670.0, RED_CLEAR_DEPTH_MM + 10.0]
     assert compute_initial_alert_status(685.0, recent_depths_mm=recent_rising) == "GREEN"
+
+
+def test_stuck_zero_rain_gauge_quarantine_and_fallback(synthetic_hourly_df: pd.DataFrame) -> None:
+    """Stuck-zero gauge for >=6h while stream rises and Open-Meteo shows rain triggers fallback to rain_mm."""
+    df_in = synthetic_hourly_df.copy()
+    df_in["swcc_rain_mm"] = np.nan
+    df_in["stump_rain_mm"] = 0.0
+    # Inject a 20 mm streamway rise + Open-Meteo rain around index 300
+    df_in.iloc[295:302, df_in.columns.get_loc("rain_mm")] = 1.5
+    df_in.iloc[300:303, df_in.columns.get_loc("depth_mm")] += 25.0
+
+    df_feat = engineer_features(df_in)
+    assert df_feat["stump_status"].iloc[300] == "stuck_zero"
+    assert df_feat["rain_source"].iloc[300] == "open_meteo"
+    assert df_feat["fused_rain_mm"].iloc[300] == 1.5
+
+
+def test_depth_step_drop_clamps_momentum_without_masking_depth(
+    synthetic_hourly_df: pd.DataFrame,
+) -> None:
+    """Non-flood sudden depth drop clamps momentum derivatives while keeping base depth_mm intact."""
+    df_in = synthetic_hourly_df.copy()
+    df_in.iloc[350:355, df_in.columns.get_loc("depth_mm")] = 680.0
+    df_in.iloc[355:360, df_in.columns.get_loc("depth_mm")] = 584.0
+
+    df_feat = engineer_features(df_in)
+    assert df_feat["depth_mm"].iloc[355] == 584.0
+    assert bool(df_feat["depth_step_drop_flag"].iloc[355]) is True
+    assert df_feat["ddepth_1h"].iloc[355] >= -10.0
+    assert df_feat["accel_1h"].iloc[355] >= -5.0
+
+
+def test_guardrails_decouple_p50_and_p90_for_short_horizons() -> None:
+    """At h<=6h, unconfirmed NWP rain can raise P90 AMBER watch without unlocking P50 RED rise cap."""
+    p10, p50, p90, tel = apply_hydrological_guardrails(
+        base_depth=575.0,
+        ddepth_1h=0.0,
+        fused_rain_3h=12.0,
+        moisture_index=0.8,
+        tank_168h=0.6,
+        horizon_h=6,
+        fut_rain_sum=15.0,
+        d_p10=10.0,
+        d_p50=150.0,
+        d_p90=220.0,
+        obs_rain_confirmed=False,
+        return_telemetry=True,
+    )
+    assert p50 == 25.0
+    assert p90 > 25.0
+    assert p10 <= p50 <= p90
+    assert tel["guardrail_clamped"] is True
+    assert tel["p50_clamp_shift_mm"] == 125.0
+
+
+def test_nrw_fallback_chain_and_payload_parser() -> None:
+    """Verify NRW 15-min/hourly parsing, completeness threshold, and club -> nrw -> open_meteo chain."""
+    from app.hydrology import parse_nrw_rainfall_payload
+
+    payload = [
+        {
+            "location": 9001,
+            "titleEn": "Tawe Upper Rain",
+            "parameters": [
+                {
+                    "paramNameEN": "Rainfall",
+                    "readings": [
+                        # Complete 4x15-min hour (sum = 3.0 mm)
+                        {"time": "2026-11-10T10:00:00Z", "value": 0.5},
+                        {"time": "2026-11-10T10:15:00Z", "value": 1.0},
+                        {"time": "2026-11-10T10:30:00Z", "value": 1.0},
+                        {"time": "2026-11-10T10:45:00Z", "value": 0.5},
+                        # Incomplete sub-hourly bucket (2 samples < 3 -> rejected)
+                        {"time": "2026-11-10T11:00:00Z", "value": 2.0},
+                        {"time": "2026-11-10T11:15:00Z", "value": 2.0},
+                    ],
+                }
+            ],
+        },
+        {
+            "location": 9002,
+            "titleEn": "Cray Headwater",
+            "parameters": [
+                {
+                    "paramNameEN": "Rainfall",
+                    "latestValue": 4.2,
+                    "latestTime": "2026-11-10T12:15:00Z",
+                }
+            ],
+        },
+    ]
+
+    nrw_series, meta = parse_nrw_rainfall_payload(payload, min_samples_per_hour=3)
+    assert meta["stations_matched"] == 2
+    assert pd.Timestamp("2026-11-10T10:00:00Z") in nrw_series.index
+    assert nrw_series.loc[pd.Timestamp("2026-11-10T10:00:00Z")] == 3.0
+    assert pd.Timestamp("2026-11-10T11:00:00Z") not in nrw_series.index
+    assert nrw_series.loc[pd.Timestamp("2026-11-10T12:00:00Z")] == 4.2
+
+    idx = pd.date_range("2026-11-01", periods=400, freq="1h", tz="UTC")
+    df_in = pd.DataFrame(
+        {
+            "depth_mm": 550.0,
+            "stump_rain_mm": np.nan,
+            "swcc_rain_mm": np.nan,
+            "nrw_rain_mm": np.nan,
+            "rain_mm": 0.4,
+            "wind_kmh": 10.0,
+            "et0_mm": 0.05,
+            "era5_soil_moisture": 0.35,
+            "era5_soil_deep": 0.35,
+            "temp_c": 9.0,
+            "era5_press_hpa": 1005.0,
+            "swcc_press_hpa": np.nan,
+            "stump_press_hpa": np.nan,
+        },
+        index=idx,
+    )
+    df_in.iloc[360, df_in.columns.get_loc("nrw_rain_mm")] = 2.8
+
+    df_feat = engineer_features(df_in)
+    assert df_feat["rain_source"].iloc[360] == "nrw"
+    assert df_feat["nrw_status"].iloc[360] == "ok"
+    assert df_feat["fused_rain_mm"].iloc[360] == 2.8
+    assert df_feat["rain_source"].iloc[361] == "open_meteo"
+    assert df_feat["fused_rain_mm"].iloc[361] == 0.4
+
+
+def test_nrw_historical_payload_and_target_filtering() -> None:
+    """Verify NRW Historical parameterReadings parsing and exclusion of lagging station 1071."""
+    from app.hydrology import (
+        NRW_EXCLUDED_STATION_IDS,
+        extract_nrw_rain_targets,
+        parse_nrw_rainfall_payload,
+    )
+
+    by_loc = [
+        {
+            "location": 1051,
+            "titleEn": "Crai Reservoir raingauge",
+            "parameters": [{"parameter": 10146, "paramNameEN": "Rainfall"}],
+        },
+        {
+            "location": 1071,
+            "titleEn": "Llanerch Yrfa raingauge",
+            "parameters": [{"parameter": 10166, "paramNameEN": "Rainfall"}],
+        },
+        {
+            "location": 1112,
+            "titleEn": "Dan Yr Ogof raingauge",
+            "parameters": [{"parameter": 10207, "paramNameEN": "Rainfall"}],
+        },
+        {
+            "location": 4091,
+            "titleEn": "Tawe at Craig y Nos",
+            "parameters": [{"parameter": 152, "paramNameEN": "River Level"}],
+        },
+    ]
+    targets = extract_nrw_rain_targets(by_loc, exclude_station_ids=NRW_EXCLUDED_STATION_IDS)
+    assert [loc for loc, _, _ in targets] == [1051, 1112]
+
+    hist_payloads = [
+        {
+            "location": 1051,
+            "titleEN": "Crai Reservoir raingauge",
+            "parameter": 10146,
+            "paramNameEN": "Rainfall",
+            "parameterReadings": [
+                {"time": "2026-11-10T18:00:00Z", "value": 0.4},
+                {"time": "2026-11-10T18:15:00Z", "value": 0.4},
+                {"time": "2026-11-10T18:30:00Z", "value": 0.4},
+                {"time": "2026-11-10T18:45:00Z", "value": 0.4},
+            ],
+        },
+        {
+            "location": 1112,
+            "titleEN": "Dan Yr Ogof raingauge",
+            "parameter": 10207,
+            "paramNameEN": "Rainfall",
+            "parameterReadings": [
+                {"time": "2026-11-10T18:00:00Z", "value": 0.2},
+                {"time": "2026-11-10T18:15:00Z", "value": 0.2},
+                {"time": "2026-11-10T18:30:00Z", "value": 0.2},
+                {"time": "2026-11-10T18:45:00Z", "value": 0.4},
+            ],
+        },
+    ]
+    ser, meta = parse_nrw_rainfall_payload(hist_payloads, exclude_station_ids=NRW_EXCLUDED_STATION_IDS)
+    assert meta["stations_matched"] == 2
+    assert ser.loc[pd.Timestamp("2026-11-10T18:00:00Z")] == 1.3

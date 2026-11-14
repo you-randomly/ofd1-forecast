@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -19,6 +20,7 @@ from app.hydrology import (
     ELEVATED_DEPTH_MM,
     HORIZONS,
     MIN_PHYSICAL_DEPTH_MM,
+    NRW_EXCLUDED_STATION_IDS,
     RED_CLEAR_DEPTH_MM,
     RED_DEPTH_MM,
     RED_TRIGGER_DEPTH_MM,
@@ -30,7 +32,9 @@ from app.hydrology import (
     engineer_features,
     enrich_nwp_ensemble_quantiles,
     evaluate_alert_hysteresis,
+    extract_nrw_rain_targets,
     nwp_cols_for_horizon,
+    parse_nrw_rainfall_payload,
     reconstruct_depth_quantiles,
     roll_future_features_for_horizon,
     roll_future_moisture_series,
@@ -66,7 +70,10 @@ class OFD1ForecastEngine:
         )
         self.aligned_1h_path = self.data_dir / "ofd1_aligned_hourly.parquet"
         self.raw_ts_path = self.data_dir / "ofd1_thingspeak_raw.parquet"
-        self.models_path = self.data_dir / "ofd1_models_v1.joblib"
+        model_ver = os.environ.get("OFD1_MODEL_VERSION", "v2").strip().lower()
+        self.model_version = model_ver if model_ver in {"v1", "v2"} else "v2"
+        self.models_path = self.data_dir / f"ofd1_models_{self.model_version}.joblib"
+        self.v1_models_path = self.data_dir / "ofd1_models_v1.joblib"
         self.metrics_path = self.data_dir / "phase2_trial_metrics.parquet"
         self.breakdown_path = self.data_dir / "horizon_breakdown_1h_to_48h.parquet"
         self.preds_backtest_path = self.data_dir / "phase2_trial_predictions.parquet"
@@ -84,6 +91,11 @@ class OFD1ForecastEngine:
         self._verification_cache: dict[tuple[int, str], dict[str, Any]] = {}
         self.last_sync_utc: str | None = None
         self.sync_status: str = "initializing"
+        self.nrw_api_key: str = os.environ.get("NRW_API_KEY", "").strip()
+        self.nrw_lat: float = float(os.environ.get("OFD1_NRW_LAT", "51.8258"))
+        self.nrw_lon: float = float(os.environ.get("OFD1_NRW_LON", "-3.6611"))
+        self.nrw_radius_m: int = int(os.environ.get("OFD1_NRW_RADIUS_M", "8000"))
+        self.source_health: dict[str, dict[str, Any]] = {}
         self.latest_payload: dict[str, Any] = {}
 
     def initialize(self, read_only: bool | None = None) -> None:
@@ -189,10 +201,19 @@ class OFD1ForecastEngine:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not load NWP archive (%s)", exc)
 
-        if self.models_path.exists():
+        load_path = self.models_path
+        if not load_path.exists() and self.model_version == "v2" and self.v1_models_path.exists():
+            logger.warning(
+                "Requested v2 models not found at %s; falling back to v1 at %s",
+                self.models_path,
+                self.v1_models_path,
+            )
+            load_path = self.v1_models_path
+
+        if load_path.exists():
             try:
-                self.models = joblib.load(self.models_path)
-                logger.info("Loaded cached multi-horizon models from %s", self.models_path)
+                self.models = joblib.load(load_path)
+                logger.info("Loaded cached multi-horizon models from %s", load_path)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed to load cached models (%s), retraining...", exc)
                 self._train_and_save_models(df_feat)
@@ -206,6 +227,11 @@ class OFD1ForecastEngine:
                 logger.warning("Could not load cached future NWP ensemble (%s)", exc)
 
         # Build initial payload from cached data before network sync
+        if "nrw" not in self.source_health:
+            self.source_health["nrw"] = {
+                "status": "configured" if self.nrw_api_key else "unconfigured",
+                "last_success_utc": None,
+            }
         self.latest_payload = self._build_dashboard_payload(df_feat, self.df_future_wx)
         self._ensure_and_update_verification_ledger(df_feat, read_only=self.read_only)
         self._verification_cache.clear()
@@ -229,7 +255,9 @@ class OFD1ForecastEngine:
         d_p10: np.ndarray | float,
         d_p50: np.ndarray | float,
         d_p90: np.ndarray | float,
-    ) -> tuple[np.ndarray | float, np.ndarray | float, np.ndarray | float]:
+        obs_rain_confirmed: np.ndarray | float | bool = True,
+        return_telemetry: bool = False,
+    ) -> tuple[Any, ...]:
         return apply_hydrological_guardrails(
             base_depth=base_depth,
             ddepth_1h=ddepth_1h,
@@ -241,6 +269,8 @@ class OFD1ForecastEngine:
             d_p10=d_p10,
             d_p50=d_p50,
             d_p90=d_p90,
+            obs_rain_confirmed=obs_rain_confirmed,
+            return_telemetry=return_telemetry,
         )
 
     def _train_and_save_models(self, df_feat: pd.DataFrame) -> None:
@@ -311,9 +341,14 @@ class OFD1ForecastEngine:
 
     async def refresh_live_telemetry(self) -> dict[str, Any]:
         """Fetch latest ThingSpeak packets + Open-Meteo 48h NWP forecast and recompute dashboard state."""
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                # 1. Fetch recent ThingSpeak entries (last 400 packets ~ 2-3 days)
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        ts_ok = False
+        om_ok = False
+        last_err: Exception | None = None
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            # 1. Fetch recent ThingSpeak entries (last 400 packets ~ 2-3 days)
+            try:
                 ts_resp = await client.get(
                     "https://api.thingspeak.com/channels/2574933/feeds.json?results=400"
                 )
@@ -361,8 +396,86 @@ class OFD1ForecastEngine:
                                 combined.loc[new_1h.index, c]
                             )
                     self.df_hourly = combined.sort_index()
+                ts_ok = True
+                self.source_health["thingspeak"] = {"status": "ok", "last_success_utc": now_iso}
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                logger.warning("ThingSpeak sync failed (using cached PVC data): %s", exc)
+                self.source_health["thingspeak"] = {
+                    "status": f"error ({type(exc).__name__})",
+                    "last_success_utc": self.source_health.get("thingspeak", {}).get("last_success_utc"),
+                }
 
-                # 2. Fetch Open-Meteo Live NWP Forecast + 6-Model NWP Super-Ensemble (past 3 days + next 3 days)
+            # 1b. Optional NRW Telemetered Rain Gauge Fallback (non-blocking Stage 3)
+            if not self.nrw_api_key:
+                self.source_health["nrw"] = {"status": "unconfigured", "last_success_utc": None}
+            else:
+                try:
+                    nrw_headers = {"Ocp-Apim-Subscription-Key": self.nrw_api_key}
+                    nrw_url = (
+                        "https://api.naturalresources.wales/rivers-and-seas/v1/api/StationData/byLocation"
+                        f"?distance={self.nrw_radius_m}&lat={self.nrw_lat}&lon={self.nrw_lon}"
+                    )
+                    nrw_resp = await client.get(nrw_url, headers=nrw_headers, timeout=10.0)
+                    nrw_resp.raise_for_status()
+                    by_loc_json = nrw_resp.json()
+                    targets = extract_nrw_rain_targets(
+                        by_loc_json, exclude_station_ids=NRW_EXCLUDED_STATION_IDS
+                    )
+                    hist_payloads: list[dict[str, Any]] = []
+                    if targets:
+                        hist_resps = await asyncio.gather(
+                            *[
+                                client.get(
+                                    "https://api.naturalresources.wales/rivers-and-seas/v1/api/StationData/Historical"
+                                    f"?location={loc_id}&parameter={param_id}",
+                                    headers=nrw_headers,
+                                    timeout=12.0,
+                                )
+                                for loc_id, param_id, _ in targets
+                            ],
+                            return_exceptions=True,
+                        )
+                        for h_resp in hist_resps:
+                            if isinstance(h_resp, httpx.Response) and h_resp.status_code == 200:
+                                body = h_resp.json()
+                                if isinstance(body, dict) and body.get("parameterReadings"):
+                                    hist_payloads.append(body)
+
+                    if hist_payloads:
+                        nrw_series, nrw_meta = parse_nrw_rainfall_payload(
+                            hist_payloads,
+                            exclude_station_ids=NRW_EXCLUDED_STATION_IDS,
+                        )
+                    else:
+                        nrw_series, nrw_meta = parse_nrw_rainfall_payload(
+                            by_loc_json,
+                            exclude_station_ids=NRW_EXCLUDED_STATION_IDS,
+                        )
+
+                    if not nrw_series.empty:
+                        if "nrw_rain_mm" not in self.df_hourly.columns:
+                            self.df_hourly["nrw_rain_mm"] = np.nan
+                        common_nrw = self.df_hourly.index.intersection(nrw_series.index)
+                        if len(common_nrw) > 0:
+                            self.df_hourly.loc[common_nrw, "nrw_rain_mm"] = nrw_series.loc[
+                                common_nrw
+                            ].combine_first(self.df_hourly.loc[common_nrw, "nrw_rain_mm"])
+                    self.source_health["nrw"] = {
+                        "status": "ok",
+                        "stations_matched": nrw_meta["stations_matched"],
+                        "station_names": nrw_meta["station_names"],
+                        "last_success_utc": now_iso,
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("NRW telemetry sync failed (non-blocking fallback): %s", exc)
+                    self.source_health["nrw"] = {
+                        "status": f"error ({type(exc).__name__})",
+                        "last_success_utc": self.source_health.get("nrw", {}).get("last_success_utc"),
+                    }
+
+            # 2. Fetch Open-Meteo Live NWP Forecast + 6-Model NWP Super-Ensemble (past 3 days + next 3 days)
+            try:
                 om_url = (
                     "https://api.open-meteo.com/v1/forecast"
                     "?latitude=51.8258&longitude=-3.6611"
@@ -504,13 +617,24 @@ class OFD1ForecastEngine:
                         # Persist updated hourly parquet to PVC
                         self.df_hourly.to_parquet(self.aligned_1h_path)
 
-            self.last_sync_utc = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+                om_ok = True
+                self.source_health["open_meteo"] = {"status": "ok", "last_success_utc": now_iso}
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                logger.warning("Open-Meteo sync failed (using cached PVC data): %s", exc)
+                self.source_health["open_meteo"] = {
+                    "status": f"error ({type(exc).__name__})",
+                    "last_success_utc": self.source_health.get("open_meteo", {}).get("last_success_utc"),
+                }
+
+        self.last_sync_utc = now_iso
+        if ts_ok and om_ok:
             self.sync_status = "live_synced"
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Live telemetry sync fallback (using cached PVC data): %s", exc)
-            self.sync_status = f"cached_offline ({type(exc).__name__})"
-            if not self.last_sync_utc:
-                self.last_sync_utc = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+        elif ts_ok or om_ok:
+            self.sync_status = "partial_sync"
+        else:
+            err_name = type(last_err).__name__ if last_err is not None else "UnknownError"
+            self.sync_status = f"cached_offline ({err_name})"
 
         df_feat = self._engineer_features(self.df_hourly)
         self.df_feat_cached = df_feat
@@ -641,6 +765,7 @@ class OFD1ForecastEngine:
             t_168 = float(now_row.get("tank_168h", 0.5))
             dd_1h = float(now_row.get("ddepth_1h", 0.0))
 
+            obs_conf = str(now_row.get("rain_source", "club")) != "open_meteo"
             d_p10_c, d_p50_c, d_p90_c = self._apply_hydrological_guardrails(
                 base_depth=base_depth,
                 ddepth_1h=dd_1h,
@@ -652,6 +777,7 @@ class OFD1ForecastEngine:
                 d_p10=d_p10_rel,
                 d_p50=d_p50_rel,
                 d_p90=d_p90_rel,
+                obs_rain_confirmed=obs_conf,
             )
 
             p10, p50, p90, p90_hydro_only = reconstruct_depth_quantiles(
@@ -880,8 +1006,14 @@ class OFD1ForecastEngine:
         # Gauge health check
         last_swcc_ts = valid_obs.dropna(subset=["swcc_rain_mm"]).index.max()
         last_stump_ts = valid_obs.dropna(subset=["stump_rain_clean"]).index.max()
+        last_nrw_ts = (
+            valid_obs.dropna(subset=["nrw_rain_clean"]).index.max()
+            if "nrw_rain_clean" in valid_obs.columns
+            else pd.NaT
+        )
         swcc_age_h = (now_ts - last_swcc_ts).total_seconds() / 3600.0 if pd.notna(last_swcc_ts) else 999.0
         stump_age_h = (now_ts - last_stump_ts).total_seconds() / 3600.0 if pd.notna(last_stump_ts) else 999.0
+        nrw_age_h = (now_ts - last_nrw_ts).total_seconds() / 3600.0 if pd.notna(last_nrw_ts) else 999.0
 
         ddepth_1h = float(now_row.get("ddepth_1h", 0.0))
         if ddepth_1h >= 15.0:
@@ -923,29 +1055,62 @@ class OFD1ForecastEngine:
                 "max_nwp_lift_48h_mm": nwp_ensemble_meta["max_nwp_lift_48h_mm"],
             },
             "nwp_ensemble": nwp_ensemble_meta,
+            "rain_source_active": str(now_row.get("rain_source", "club")),
+            "source_health": self.source_health,
             "gauges": {
                 "depth_sensor": {
                     "name": "OFD1 Streamway Pressure Sensor (field1)",
-                    "status": "ONLINE",
+                    "status": "STEP_DROP_CLAMPED"
+                    if bool(now_row.get("depth_step_drop_flag", False))
+                    else "ONLINE",
                     "cadence": "10 min",
                     "last_seen": now_ts.strftime("%Y-%m-%d %H:%M UTC"),
                 },
                 "stump_gauge": {
                     "name": "The Stump Upland Rain/Press (field4/5)",
-                    "status": "ONLINE" if stump_age_h <= 4.0 else "STALE / FAILOVER",
+                    "status": "STUCK_ZERO (Quarantined)"
+                    if str(now_row.get("stump_status", "ok")) == "stuck_zero"
+                    else ("ONLINE" if stump_age_h <= 4.0 else "STALE / FAILOVER"),
+                    "raw_status": str(now_row.get("stump_status", "ok")),
                     "cadence": "30 min",
                     "last_seen": last_stump_ts.strftime("%Y-%m-%d %H:%M UTC")
                     if pd.notna(last_stump_ts)
                     else "N/A",
-                    "glitch_filter": "Active (Oct 2026 96.6mm/h latch masked)",
+                    "glitch_filter": "Active (Oct 2026 96.6mm/h latch + stuck-zero mask)",
                 },
                 "swcc_gauge": {
                     "name": "SWCC HQ Rain/Press (field2/3)",
-                    "status": "ONLINE" if swcc_age_h <= 4.0 else "OFFLINE (Auto-Failover Active)",
+                    "status": "STUCK_ZERO (Quarantined)"
+                    if str(now_row.get("swcc_status", "ok")) == "stuck_zero"
+                    else ("ONLINE" if swcc_age_h <= 4.0 else "OFFLINE (Auto-Failover Active)"),
+                    "raw_status": str(now_row.get("swcc_status", "ok")),
                     "cadence": "30 min",
                     "last_seen": last_swcc_ts.strftime("%Y-%m-%d %H:%M UTC")
                     if pd.notna(last_swcc_ts)
                     else "N/A",
+                },
+                "nrw_gauge": {
+                    "name": "NRW Upper Tawe/Cray Telemetry (Stage 3 Fallback)",
+                    "status": (
+                        "ONLINE (Active Fallback)"
+                        if str(now_row.get("rain_source", "")) == "nrw"
+                        else (
+                            "ONLINE (Standby)"
+                            if nrw_age_h <= 4.0
+                            else (
+                                "UNCONFIGURED (Optional)"
+                                if not self.nrw_api_key
+                                else "OFFLINE / STANDBY"
+                            )
+                        )
+                    ),
+                    "raw_status": str(now_row.get("nrw_status", "offline")),
+                    "cadence": "15 min -> 1h",
+                    "last_seen": (
+                        last_nrw_ts.strftime("%Y-%m-%d %H:%M UTC")
+                        if pd.notna(last_nrw_ts)
+                        else ("Set NRW_API_KEY to enable" if not self.nrw_api_key else "N/A")
+                    ),
                 },
                 "nwp_ensemble": {
                     "name": nwp_ensemble_meta["mode"],
@@ -1333,7 +1498,7 @@ class OFD1ForecastEngine:
                                 "pred_p90_mm": np.round(p90, 1),
                                 "actual_depth_mm": np.nan,
                                 "rain_mm": np.nan,
-                                "source": "live_forecast",
+                                "source": "catchup_hindsight",
                             }
                         )
                         catchup_chunks.append(chunk)

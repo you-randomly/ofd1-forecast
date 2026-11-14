@@ -91,23 +91,113 @@ def engineer_features(df_in: pd.DataFrame) -> pd.DataFrame:
     """Compute causal hydrological features, glitch filters, and full-history expanding bounds."""
     df = df_in.copy().sort_index()
 
-    # 1. Glitch-filtered Stump rain
+    # 1. Depth lags, velocity & non-flood step-drop momentum clamp
+    for lag in [1, 2, 3, 4, 6, 12, 24]:
+        df[f"ddepth_{lag}h"] = df["depth_mm"] - df["depth_mm"].shift(lag)
+    df["accel_1h"] = df["ddepth_1h"] - df["ddepth_1h"].shift(1)
+
+    prev_depth_2h = df["depth_mm"].shift(2)
+    step_drop_hit = (prev_depth_2h < 750.0) & (
+        (df["ddepth_1h"] <= -30.0) | (df["ddepth_2h"] <= -50.0)
+    )
+    step_drop_window = step_drop_hit.rolling(3, min_periods=1).max().fillna(0).astype(bool)
+    df["depth_step_drop_flag"] = step_drop_hit.fillna(False)
+    for lag in [1, 2, 3, 4, 6, 12, 24]:
+        col = f"ddepth_{lag}h"
+        df[col] = np.where(step_drop_window, np.maximum(df[col], -10.0), df[col])
+    df["accel_1h"] = np.where(step_drop_window, np.maximum(df["accel_1h"], -5.0), df["accel_1h"])
+
+    # 2. Glitch-filtered Stump, SWCC, and optional NRW rain with stuck-zero quarantine
     stump_glitch = (df["stump_rain_mm"] >= 15.0) & (
         (df["swcc_rain_mm"].fillna(0) < 5.0) & (df["rain_mm"].fillna(0) < 5.0)
     )
     df["stump_glitch_flag"] = stump_glitch
-    df["stump_rain_clean"] = df["stump_rain_mm"].mask(stump_glitch, np.nan)
-    df["club_rain_mean"] = df[["stump_rain_clean", "swcc_rain_mm"]].mean(axis=1)
-    df["fused_rain_mm"] = df["club_rain_mean"].fillna(df["rain_mm"]).fillna(0.0)
+    stump_clean = df["stump_rain_mm"].mask(stump_glitch, np.nan)
+    swcc_clean = df["swcc_rain_mm"].copy()
+
+    nrw_raw = (
+        pd.to_numeric(df["nrw_rain_mm"], errors="coerce")
+        if "nrw_rain_mm" in df.columns
+        else pd.Series(np.nan, index=df.index, dtype=float)
+    )
+    nrw_glitch = (nrw_raw >= 25.0) & (
+        (df["swcc_rain_mm"].fillna(0.0) < 5.0)
+        & (stump_clean.fillna(0.0) < 5.0)
+        & (df["rain_mm"].fillna(0.0) < 5.0)
+    )
+    df["nrw_glitch_flag"] = nrw_glitch.fillna(False)
+    nrw_clean = nrw_raw.mask(nrw_glitch, np.nan)
+
+    def _stuck_zero_mask(series: pd.Series, peer: pd.Series) -> pd.Series:
+        flat_6h = series.notna() & (series.rolling(6, min_periods=6).sum() == 0.0)
+        peer_rain = peer.fillna(0.0).rolling(3, min_periods=1).sum() >= 0.5
+        hydro_nwp_agree = (df["ddepth_3h"].fillna(0.0) >= 10.0) & (
+            df["rain_mm"].fillna(0.0).rolling(6, min_periods=1).sum() >= 1.0
+        )
+        return flat_6h & (peer_rain | hydro_nwp_agree)
+
+    stump_peer = pd.concat([swcc_clean, nrw_clean], axis=1).max(axis=1)
+    swcc_peer = pd.concat([stump_clean, nrw_clean], axis=1).max(axis=1)
+    nrw_peer = pd.concat([stump_clean, swcc_clean], axis=1).max(axis=1)
+
+    stump_stuck = _stuck_zero_mask(stump_clean, stump_peer)
+    swcc_stuck = _stuck_zero_mask(swcc_clean, swcc_peer)
+    nrw_stuck = _stuck_zero_mask(nrw_clean, nrw_peer)
+    df["stump_stuck_zero_flag"] = stump_stuck.fillna(False)
+    df["swcc_stuck_zero_flag"] = swcc_stuck.fillna(False)
+    df["nrw_stuck_zero_flag"] = nrw_stuck.fillna(False)
+
+    stump_clean = stump_clean.mask(stump_stuck, np.nan)
+    swcc_clean = swcc_clean.mask(swcc_stuck, np.nan)
+    nrw_clean = nrw_clean.mask(nrw_stuck, np.nan)
+    df["stump_rain_clean"] = stump_clean
+    df["nrw_rain_clean"] = nrw_clean
+
+    df["stump_status"] = np.where(
+        df["stump_rain_mm"].isna(),
+        "offline",
+        np.where(stump_glitch, "glitch", np.where(stump_stuck, "stuck_zero", "ok")),
+    )
+    df["swcc_status"] = np.where(
+        df["swcc_rain_mm"].isna(),
+        "offline",
+        np.where(swcc_stuck, "stuck_zero", "ok"),
+    )
+    df["nrw_status"] = np.where(
+        nrw_raw.isna(),
+        "offline",
+        np.where(nrw_glitch, "glitch", np.where(nrw_stuck, "stuck_zero", "ok")),
+    )
+
+    df["club_rain_mean"] = pd.concat([stump_clean, swcc_clean], axis=1).mean(axis=1)
+    df["rain_source"] = np.where(
+        stump_clean.notna() & swcc_clean.notna(),
+        "club",
+        np.where(
+            swcc_clean.notna(),
+            "swcc",
+            np.where(
+                stump_clean.notna(),
+                "stump",
+                np.where(nrw_clean.notna(), "nrw", "open_meteo"),
+            ),
+        ),
+    )
+    df["fused_rain_mm"] = (
+        df["club_rain_mean"]
+        .fillna(nrw_clean)
+        .fillna(df["rain_mm"])
+        .fillna(0.0)
+    )
 
     wind_factor = 1.0 + 0.004 * (df["wind_kmh"].fillna(15.0) - 15.0).clip(lower=0.0)
     df["fused_rain_wind_adj"] = df["fused_rain_mm"] * wind_factor
 
-    # 2. Rolling 30-day (720h) 5th-percentile baseflow datum
+    # 3. Rolling 30-day (720h) 5th-percentile baseflow datum
     df["baseflow_30d"] = df["depth_mm"].rolling(720, min_periods=24).quantile(0.05).bfill()
     df["stage_above_base"] = df["depth_mm"] - df["baseflow_30d"]
 
-    # 3. Antecedent moisture tanks
+    # 4. Antecedent moisture tanks
     et0 = df["et0_mm"].fillna(0.05)
     net_rain = (df["fused_rain_mm"] - 0.8 * et0).clip(lower=0.0)
     rain_ref = df["rain_mm"].fillna(df["fused_rain_mm"]).fillna(0.0)
@@ -130,11 +220,6 @@ def engineer_features(df_in: pd.DataFrame) -> pd.DataFrame:
     tank_norm = (df["tank_168h"] / (tank_168h_p95 + 1e-6)).clip(0.05, 1.5)
     df["moisture_index"] = (0.5 * sat_norm + 0.5 * tank_norm).fillna(0.5)
     df["eff_rain_mm"] = df["fused_rain_wind_adj"] * (df["moisture_index"] ** 1.5)
-
-    # 4. Depth lags & velocity
-    for lag in [1, 2, 3, 4, 6, 12, 24]:
-        df[f"ddepth_{lag}h"] = df["depth_mm"] - df["depth_mm"].shift(lag)
-    df["accel_1h"] = df["ddepth_1h"] - df["ddepth_1h"].shift(1)
 
     # 5. Rain lags & rolling sums
     for lag in range(7):
@@ -168,6 +253,50 @@ def attach_horizon_future_cols(df: pd.DataFrame, h: int) -> pd.DataFrame:
     for k in range(min(h, 6)):
         work[f"fut_rain_minus_{k}h_from_target"] = work["rain_mm"].shift(-(h - k))
     return work
+
+
+def build_archived_nwp_trajectories(
+    arch: pd.DataFrame, valid_obs: pd.DataFrame, issue_idx: pd.DatetimeIndex
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return (N, 48) matrices of future hourly rain from archived NWP d0/d1/d2 forecasts:
+    (det_rain, ens_p10, ens_p50, ens_p90, perf_rain, member_spread_48h).
+    """
+    n_issues = len(issue_idx)
+    full_idx = pd.date_range(
+        issue_idx.min() + pd.Timedelta(hours=1),
+        issue_idx.max() + pd.Timedelta(hours=48),
+        freq="1h",
+        tz="UTC",
+    )
+    arch_re = arch.reindex(full_idx)
+    obs_rain_s = valid_obs["rain_mm"].reindex(full_idx).fillna(0.0).values
+
+    base_offsets = ((issue_idx - full_idx[0]) // pd.Timedelta(hours=1)).values.astype(int)
+    grid_idx = base_offsets[:, None] + np.arange(48, dtype=int)[None, :]
+
+    lead_h = np.arange(1, 49)
+    m_d0 = lead_h <= 6
+    m_d1 = (lead_h > 6) & (lead_h <= 30)
+    m_d2 = lead_h > 30
+
+    member_mats = []
+    for slug in NWP_MODELS:
+        c0 = arch_re[f"{slug}_d0"].values if f"{slug}_d0" in arch_re else np.full(len(full_idx), np.nan)
+        c1 = arch_re[f"{slug}_d1"].values if f"{slug}_d1" in arch_re else np.full(len(full_idx), np.nan)
+        c2 = arch_re[f"{slug}_d2"].values if f"{slug}_d2" in arch_re else np.full(len(full_idx), np.nan)
+        mat = np.empty((n_issues, 48), dtype=float)
+        mat[:, m_d0] = c0[grid_idx[:, m_d0]]
+        mat[:, m_d1] = c1[grid_idx[:, m_d1]]
+        mat[:, m_d2] = c2[grid_idx[:, m_d2]]
+        member_mats.append(mat)
+
+    stack = np.stack(member_mats, axis=0)
+    det_rain = np.where(np.isnan(stack[0]), np.nanmedian(stack, axis=0), stack[0])
+    det_rain = np.nan_to_num(det_rain, nan=0.0)
+
+    rain_p10, rain_p50, rain_p90, spread_48h = compute_nwp_ensemble_quantiles(stack, det_rain)
+    perf_rain = obs_rain_s[grid_idx]
+    return det_rain, rain_p10, rain_p50, rain_p90, perf_rain, spread_48h
 
 
 def roll_future_features_for_horizon(
@@ -507,12 +636,15 @@ def apply_hydrological_guardrails(
     d_p10: np.ndarray | float,
     d_p50: np.ndarray | float,
     d_p90: np.ndarray | float,
-) -> tuple[np.ndarray | float, np.ndarray | float, np.ndarray | float]:
+    obs_rain_confirmed: np.ndarray | float | bool = True,
+    return_telemetry: bool = False,
+) -> tuple[Any, ...]:
     """Apply physical karst rate-of-rise and peat sponge infiltration guardrails.
 
-    All three inputs ``d_p10``, ``d_p50``, and ``d_p90`` are depth deltas (in mm) relative to ``base_depth``.
-    When ``d_p50`` is clamped downward by ``p50_clamp_shift = d_p50 - clamped_p50``, ``d_p10`` is shifted
-    by the same amount so the lower quantile spread is preserved without collapsing ``p10`` onto ``p50``.
+    At short horizons (``horizon_h <= 6``), P50 ``allowed_rise`` is capped using confirmed
+    observed rain (``fused_rain_3h`` when local gauges are active) plus active stream rise
+    (``ddepth_1h``), preventing unconfirmed NWP drizzle from triggering RED P50 alarms while
+    still letting ``d_p90`` reflect ``fused_rain_3h + fut_rain_sum`` for AMBER watches.
     """
     is_scalar = np.isscalar(base_depth) or isinstance(base_depth, float)
     b_d = np.asarray(base_depth, dtype=float)
@@ -524,32 +656,51 @@ def apply_hydrological_guardrails(
     dp10 = np.asarray(d_p10, dtype=float)
     dp50 = np.asarray(d_p50, dtype=float)
     dp90 = np.asarray(d_p90, dtype=float)
+    obs_conf = np.asarray(obs_rain_confirmed, dtype=bool)
 
-    rain_avail = r3h + rfut
     sat_factor = np.clip(m_idx**1.5, 0.15, 1.0)
-
-    # Peat sponge absorption deduction: when 7-day tank is dry (< 0.5), initial ~8mm rain is retained
     sponge_deduct = np.where(t168 < 0.5, 8.0, 0.0)
-    eff_rain = np.maximum(0.0, rain_avail - sponge_deduct) * sat_factor
 
-    # Maximum physical rise for OFD1 karst: 25mm baseflow buffer + 12mm rise per 1mm effective rain
-    max_phys_rise = 25.0 + 12.0 * eff_rain
+    # P90 (and P50 for h > 6h) can respond to NWP future rain
+    rain_avail_nwp = r3h + rfut
+    eff_rain_nwp = np.maximum(0.0, rain_avail_nwp - sponge_deduct) * sat_factor
+    max_phys_rise_nwp = 25.0 + 12.0 * eff_rain_nwp
+    max_rate_rise_nwp = np.where(eff_rain_nwp < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
+    allowed_rise_nwp = np.minimum(max_phys_rise_nwp, max_rate_rise_nwp)
 
-    # Slew rate limit: max 30-35 mm/h for lead times <= 6h unless rain is heavy
-    max_rate_rise = np.where(eff_rain < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
-    allowed_rise = np.minimum(max_phys_rise, max_rate_rise)
+    # Short-range (+1..+6h) P50 ignores unconfirmed NWP drizzle (<10mm) or NWP when gauges are offline
+    if horizon_h <= 6:
+        r3h_obs = np.where(obs_conf, r3h, 0.0)
+        rfut_p50 = np.where(obs_conf & ((r3h_obs > 0.5) | (rfut >= 10.0)), rfut, 0.0)
+        eff_rain_obs = np.maximum(0.0, r3h_obs + rfut_p50 - sponge_deduct) * sat_factor
+        max_phys_rise_obs = 25.0 + 12.0 * eff_rain_obs + np.maximum(0.0, dd1) * 1.5
+        max_rate_rise_obs = np.where(eff_rain_obs < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
+        allowed_rise_p50 = np.minimum(max_phys_rise_obs, max_rate_rise_obs)
+    else:
+        allowed_rise_p50 = allowed_rise_nwp
 
     # Apply clamp only when base depth is below Amber (< 620 mm) and not already surging (ddepth_1h < 15 mm)
     clamp_mask = (b_d < AMBER_DEPTH_MM) & (dd1 < 15.0)
 
-    clamped_p50 = np.where(clamp_mask, np.minimum(dp50, allowed_rise), dp50)
-    clamped_p90 = np.where(clamp_mask, np.minimum(dp90, allowed_rise * 1.5 + 20.0), dp90)
+    clamped_p50 = np.where(clamp_mask, np.minimum(dp50, allowed_rise_p50), dp50)
+    clamped_p90 = np.where(clamp_mask, np.minimum(dp90, allowed_rise_nwp * 1.5 + 20.0), dp90)
     p50_clamp_shift = dp50 - clamped_p50
+    p90_clamp_shift = dp90 - clamped_p90
     clamped_p10 = np.where(
         clamp_mask,
         np.minimum(dp10 - p50_clamp_shift, clamped_p50),
         np.minimum(dp10, clamped_p50),
     )
+
+    if return_telemetry:
+        telemetry = {
+            "guardrail_clamped": bool(np.any(p50_clamp_shift > 0) or np.any(p90_clamp_shift > 0)),
+            "p50_clamp_shift_mm": float(np.max(p50_clamp_shift)),
+            "p90_clamp_shift_mm": float(np.max(p90_clamp_shift)),
+        }
+        if is_scalar:
+            return float(clamped_p10), float(clamped_p50), float(clamped_p90), telemetry
+        return clamped_p10, clamped_p50, clamped_p90, telemetry
 
     if is_scalar:
         return float(clamped_p10), float(clamped_p50), float(clamped_p90)
@@ -664,3 +815,149 @@ def evaluate_alert_hysteresis(
         prev_status = status
 
     return statuses
+
+
+# Llanerch Yrfa (#1071) lags telemetry ~8h and correlates weakly with OFD1 (+2h CCF 0.365
+# vs 0.546 for Dan Yr Ogof #1112 and 0.492 for Crai Reservoir #1051), so exclude it by default.
+NRW_EXCLUDED_STATION_IDS: frozenset[int] = frozenset({1071})
+
+
+def _nrw_station_list(payload: Any) -> list[dict[str, Any]]:
+    """Normalize NRW StationData list, wrapper dict, or single Historical dict into a list."""
+    if isinstance(payload, list):
+        return [st for st in payload if isinstance(st, dict)]
+    if isinstance(payload, dict):
+        if "stations" in payload or "items" in payload:
+            raw = payload.get("stations") or payload.get("items") or []
+            return [st for st in raw if isinstance(st, dict)]
+        if any(k in payload for k in ("parameterReadings", "readings", "parameters")):
+            return [payload]
+    return []
+
+
+def extract_nrw_rain_targets(
+    payload: Any,
+    exclude_station_ids: set[int] | frozenset[int] | None = NRW_EXCLUDED_STATION_IDS,
+) -> list[tuple[int, int, str]]:
+    """Extract (location_id, parameter_id, title) rainfall targets from NRW byLocation JSON."""
+    excluded = set(exclude_station_ids or ())
+    targets: list[tuple[int, int, str]] = []
+    for st in _nrw_station_list(payload):
+        raw_loc = st.get("location") if st.get("location") is not None else st.get("stationId")
+        try:
+            loc_id = int(raw_loc)
+        except (TypeError, ValueError):
+            continue
+        if loc_id in excluded:
+            continue
+        st_name = str(st.get("titleEn") or st.get("titleEN") or st.get("nameEN") or loc_id)
+        params = st.get("parameters") if isinstance(st.get("parameters"), list) else [st]
+        for param in params:
+            if not isinstance(param, dict):
+                continue
+            p_name = str(param.get("paramNameEN") or "").lower()
+            p_title = str(param.get("titleEn") or param.get("titleEN") or "").lower()
+            if "rain" not in p_name and "rain" not in p_title and "rain" not in st_name.lower():
+                continue
+            raw_param = param.get("parameter")
+            try:
+                param_id = int(raw_param)
+            except (TypeError, ValueError):
+                continue
+            targets.append((loc_id, param_id, st_name))
+            break
+    return targets
+
+
+def _extract_nrw_parameter_hourly(
+    param: dict[str, Any], min_samples_per_hour: int = 3
+) -> pd.Series | None:
+    """Aggregate a single NRW rainfall parameter dict into a 1h UTC rainfall Series."""
+    readings = param.get("readings") or param.get("parameterReadings")
+    if isinstance(readings, list) and readings:
+        rows: list[tuple[pd.Timestamp, float]] = []
+        for entry in readings:
+            if not isinstance(entry, dict):
+                continue
+            raw_ts = entry.get("time") or entry.get("timestamp") or entry.get("dateTime")
+            raw_val = entry.get("value") if "value" in entry else entry.get("val")
+            if raw_ts is None or raw_val is None:
+                continue
+            ts = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                continue
+            if pd.isna(ts) or not (0.0 <= val <= 100.0):
+                continue
+            rows.append((ts.floor("1h"), val))
+
+        if not rows:
+            return None
+        s_raw = pd.DataFrame(rows, columns=["timestamp", "val"]).groupby("timestamp")["val"]
+        counts = s_raw.count()
+        totals = s_raw.sum()
+        if int(counts.max()) > 1:
+            valid = totals[counts >= min_samples_per_hour]
+        else:
+            valid = totals
+        return valid.astype(float) if not valid.empty else None
+
+    latest_val = param.get("latestValue")
+    latest_time = param.get("latestTime")
+    if latest_val is not None and latest_time is not None:
+        ts = pd.to_datetime(latest_time, utc=True, errors="coerce")
+        try:
+            val = float(latest_val)
+        except (TypeError, ValueError):
+            return None
+        if pd.notna(ts) and (0.0 <= val <= 100.0):
+            return pd.Series([val], index=pd.DatetimeIndex([ts.floor("1h")], name="timestamp"), dtype=float)
+    return None
+
+
+def parse_nrw_rainfall_payload(
+    payload: Any,
+    min_samples_per_hour: int = 3,
+    exclude_station_ids: set[int] | frozenset[int] | None = None,
+) -> tuple[pd.Series, dict[str, Any]]:
+    """Parse NRW StationData byLocation or Historical JSON into an hourly UTC rainfall Series."""
+    excluded = set(exclude_station_ids or ())
+    stations = _nrw_station_list(payload)
+
+    station_series: list[pd.Series] = []
+    station_names: list[str] = []
+    for st in stations:
+        raw_loc = st.get("location") if st.get("location") is not None else st.get("stationId")
+        if raw_loc is not None and excluded:
+            try:
+                if int(raw_loc) in excluded:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        st_name = str(st.get("titleEn") or st.get("titleEN") or st.get("nameEN") or raw_loc or "NRW")
+        params = st.get("parameters") if isinstance(st.get("parameters"), list) else [st]
+        for param in params:
+            if not isinstance(param, dict):
+                continue
+            p_name = str(param.get("paramNameEN") or "").lower()
+            p_title = str(param.get("titleEn") or param.get("titleEN") or "").lower()
+            if "rain" not in p_name and "rain" not in p_title and "rain" not in st_name.lower():
+                continue
+            extracted = _extract_nrw_parameter_hourly(param, min_samples_per_hour=min_samples_per_hour)
+            if extracted is not None and not extracted.empty:
+                station_series.append(extracted)
+                station_names.append(st_name)
+                break
+
+    if not station_series:
+        empty = pd.Series(dtype=float)
+        empty.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+        return empty, {"stations_matched": 0, "station_names": []}
+
+    combined = pd.concat(station_series, axis=1).mean(axis=1).sort_index()
+    combined.index.name = "timestamp"
+    return combined, {
+        "stations_matched": len(station_names),
+        "station_names": station_names,
+    }
