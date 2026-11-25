@@ -143,7 +143,7 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out)
 
-    cov = {c: int(df[c].notna().sum()) for c in df.columns if c.endswith("_d1") or c.endswith("_d2")}
+    cov = {c: int(df[c].notna().sum()) for c in df.columns if c.endswith(("_d1", "_d2"))}
     print(f"Saved {len(df)} hourly rows to {out} ({df.index.min()} → {df.index.max()})")
     print("Non-null counts:", cov)
 

@@ -43,7 +43,7 @@ spec:
             - name: OFD1_REFRESH_SECONDS
               value: "600"
             - name: OFD1_MODEL_VERSION
-              value: "v2"
+              value: "v3"
             - name: NRW_API_KEY
               valueFrom:
                 secretKeyRef:

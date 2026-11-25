@@ -26,8 +26,10 @@ from app.hydrology import (
     RED_TRIGGER_DEPTH_MM,
     STEP_DATUM_MM,
     TRAIN_SPLIT_UTC,
+    apply_dry_conformal_padding,
     apply_hydrological_guardrails,
     attach_horizon_future_cols,
+    build_archived_nwp_trajectories,
     combine_ensemble_quantile_deltas,
     engineer_features,
     enrich_nwp_ensemble_quantiles,
@@ -70,9 +72,10 @@ class OFD1ForecastEngine:
         )
         self.aligned_1h_path = self.data_dir / "ofd1_aligned_hourly.parquet"
         self.raw_ts_path = self.data_dir / "ofd1_thingspeak_raw.parquet"
-        model_ver = os.environ.get("OFD1_MODEL_VERSION", "v2").strip().lower()
-        self.model_version = model_ver if model_ver in {"v1", "v2"} else "v2"
+        model_ver = os.environ.get("OFD1_MODEL_VERSION", "v3").strip().lower()
+        self.model_version = model_ver if model_ver in {"v1", "v2", "v3"} else "v3"
         self.models_path = self.data_dir / f"ofd1_models_{self.model_version}.joblib"
+        self.v2_models_path = self.data_dir / "ofd1_models_v2.joblib"
         self.v1_models_path = self.data_dir / "ofd1_models_v1.joblib"
         self.metrics_path = self.data_dir / "phase2_trial_metrics.parquet"
         self.breakdown_path = self.data_dir / "horizon_breakdown_1h_to_48h.parquet"
@@ -202,13 +205,31 @@ class OFD1ForecastEngine:
                 logger.warning("Could not load NWP archive (%s)", exc)
 
         load_path = self.models_path
-        if not load_path.exists() and self.model_version == "v2" and self.v1_models_path.exists():
+        if not load_path.exists() and self.model_version == "v3":
+            if self.v2_models_path.exists():
+                logger.warning(
+                    "Requested v3 models not found at %s; falling back to v2 at %s",
+                    self.models_path,
+                    self.v2_models_path,
+                )
+                load_path = self.v2_models_path
+                self.model_version = "v2"
+            elif self.v1_models_path.exists():
+                logger.warning(
+                    "Requested v3 models not found at %s; falling back to v1 at %s",
+                    self.models_path,
+                    self.v1_models_path,
+                )
+                load_path = self.v1_models_path
+                self.model_version = "v1"
+        elif not load_path.exists() and self.model_version == "v2" and self.v1_models_path.exists():
             logger.warning(
                 "Requested v2 models not found at %s; falling back to v1 at %s",
                 self.models_path,
                 self.v1_models_path,
             )
             load_path = self.v1_models_path
+            self.model_version = "v1"
 
         if load_path.exists():
             try:
@@ -273,18 +294,25 @@ class OFD1ForecastEngine:
             return_telemetry=return_telemetry,
         )
 
+    @staticmethod
+    def _select_model_X(est: Any, x_df: pd.DataFrame) -> pd.DataFrame:
+        if hasattr(est, "feature_names_in_"):
+            return x_df[list(est.feature_names_in_)]
+        return x_df
+
     def _train_and_save_models(self, df_feat: pd.DataFrame) -> None:
         logger.info(
             "Training multi-horizon P10/P50/P90 Hydro-GBDT models strictly on training split (< %s)...",
             TRAIN_SPLIT_UTC,
         )
-        trained: dict[int, dict[str, HistGradientBoostingRegressor]] = {}
+        trained: dict[int, dict[str, Any]] = {}
 
         modern_era_ts = pd.Timestamp("2024-05-17 00:00:00+00:00")
         for h in HORIZONS:
             work = self._attach_horizon_future_cols(df_feat, h)
             work["target_delta"] = work["depth_mm"].shift(-h) - work["depth_mm"]
-            f_cols = CAUSAL_COLS + nwp_cols_for_horizon(h)
+            nwp_cols = nwp_cols_for_horizon(h)
+            f_cols = CAUSAL_COLS + nwp_cols
 
             # Enforce strict chronological split: only train where target arrival timestamp < TRAIN_SPLIT_UTC
             target_ts = work.index + pd.Timedelta(hours=h)
@@ -294,18 +322,22 @@ class OFD1ForecastEngine:
             ).copy()
             X = valid[f_cols]
             y = valid["target_delta"].values
-            # Weight modern 2024-2025 multi-gauge era 2.5x so short horizons prioritize The Stump while 6-48h leverages 2015-2025
-            sample_w = np.where(valid.index >= modern_era_ts, 2.5, 1.0)
-            nwp_set = set(nwp_cols_for_horizon(h))
-            mono_cst = [1 if c in nwp_set else 0 for c in f_cols]
+            sample_w = np.where(valid.index >= modern_era_ts, 2.5 if h == 1 else 1.5, 1.0)
+            nwp_set = set(nwp_cols)
+            mono_cst: list[int] | None = (
+                [1 if (c in nwp_set and "tank" not in c) else 0 for c in f_cols]
+                if h in {2, 3, 6}
+                else None
+            )
 
             m_p50 = HistGradientBoostingRegressor(
                 loss="squared_error",
                 max_iter=300,
                 learning_rate=0.04,
-                max_depth=6,
-                min_samples_leaf=25,
-                l2_regularization=2.0,
+                max_depth=None if h in {2, 3, 6} else 6,
+                max_leaf_nodes=41 if h in {2, 3, 6} else 31,
+                min_samples_leaf=30 if h in {2, 3, 6} else 25,
+                l2_regularization=1.0 if h in {2, 3, 6} else 2.0,
                 monotonic_cst=mono_cst,
                 random_state=42,
             )
@@ -314,8 +346,10 @@ class OFD1ForecastEngine:
                 quantile=0.10,
                 max_iter=220,
                 learning_rate=0.04,
-                max_depth=5,
+                max_depth=None if h in {2, 3, 6} else 5,
+                max_leaf_nodes=41 if h in {2, 3, 6} else 31,
                 min_samples_leaf=30,
+                l2_regularization=1.0,
                 monotonic_cst=mono_cst,
                 random_state=42,
             )
@@ -324,15 +358,17 @@ class OFD1ForecastEngine:
                 quantile=0.90,
                 max_iter=220,
                 learning_rate=0.04,
-                max_depth=5,
+                max_depth=None if h in {2, 3, 6} else 5,
+                max_leaf_nodes=41 if h in {2, 3, 6} else 31,
                 min_samples_leaf=30,
+                l2_regularization=1.0,
                 monotonic_cst=mono_cst,
                 random_state=42,
             )
             m_p50.fit(X, y, sample_weight=sample_w)
             m_p10.fit(X, y, sample_weight=sample_w)
             m_p90.fit(X, y, sample_weight=sample_w)
-            trained[h] = {"p10": m_p10, "p50": m_p50, "p90": m_p90}
+            trained[h] = {"p10": m_p10, "p50": m_p50, "p90": m_p90, "pad_dry_mm": 0.0}
 
         self.models = trained
         if not self.read_only:
@@ -733,17 +769,25 @@ class OFD1ForecastEngine:
             }
         ]
 
+        include_legacy = self.model_version in {"v1", "v2"}
         for h in HORIZONS:
-            x_row_p10 = roll_future_features_for_horizon(obs_up_to_now, issue_idx, p10_mat, h)
-            x_row_p50 = roll_future_features_for_horizon(obs_up_to_now, issue_idx, p50_mat, h)
-            x_row_p90 = roll_future_features_for_horizon(obs_up_to_now, issue_idx, p90_mat, h)
+            x_row_p10 = roll_future_features_for_horizon(
+                obs_up_to_now, issue_idx, p10_mat, h, include_legacy_cols=include_legacy
+            )
+            x_row_p50 = roll_future_features_for_horizon(
+                obs_up_to_now, issue_idx, p50_mat, h, include_legacy_cols=include_legacy
+            )
+            x_row_p90 = roll_future_features_for_horizon(
+                obs_up_to_now, issue_idx, p90_mat, h, include_legacy_cols=include_legacy
+            )
 
-            d_p50 = float(self.models[h]["p50"].predict(x_row_p50)[0])
-            d_p10_on_p50 = float(self.models[h]["p10"].predict(x_row_p50)[0])
-            d_p50_on_p10 = float(self.models[h]["p50"].predict(x_row_p10)[0])
-            d_p90_on_p50 = float(self.models[h]["p90"].predict(x_row_p50)[0])
-            d_p90_on_p90 = float(self.models[h]["p90"].predict(x_row_p90)[0])
-            d_p50_on_p90 = float(self.models[h]["p50"].predict(x_row_p90)[0])
+            m_h = self.models[h]
+            d_p50 = float(m_h["p50"].predict(self._select_model_X(m_h["p50"], x_row_p50))[0])
+            d_p10_on_p50 = float(m_h["p10"].predict(self._select_model_X(m_h["p10"], x_row_p50))[0])
+            d_p50_on_p10 = float(m_h["p50"].predict(self._select_model_X(m_h["p50"], x_row_p10))[0])
+            d_p90_on_p50 = float(m_h["p90"].predict(self._select_model_X(m_h["p90"], x_row_p50))[0])
+            d_p90_on_p90 = float(m_h["p90"].predict(self._select_model_X(m_h["p90"], x_row_p90))[0])
+            d_p50_on_p90 = float(m_h["p50"].predict(self._select_model_X(m_h["p50"], x_row_p90))[0])
 
             d_p10_rel, d_p50_rel, d_p90_rel, delta_hydro_high = combine_ensemble_quantile_deltas(
                 d_p50=d_p50,
@@ -754,16 +798,22 @@ class OFD1ForecastEngine:
                 d_p50_on_p90=d_p50_on_p90,
             )
 
-            # Apply physical karst rate-of-rise and peat sponge infiltration guardrails
+            # Apply dry-regime conformal padding + physical karst guardrails
             fused_3h = float(now_row.get("fused_rain_sum_3h", 0.0))
-            fut_sum = (
-                float(x_row_p50["fut_rain_sum_6h_at_target"].iloc[0])
-                if "fut_rain_sum_6h_at_target" in x_row_p50
-                else 0.0
-            )
+            fut_sum = float(np.sum(p50_mat[0, :h]))
             moist_idx = float(now_row.get("moisture_index", 0.5))
             t_168 = float(now_row.get("tank_168h", 0.5))
             dd_1h = float(now_row.get("ddepth_1h", 0.0))
+
+            d_p10_rel, d_p50_rel, d_p90_rel = apply_dry_conformal_padding(
+                base_depth=base_depth,
+                ddepth_1h=dd_1h,
+                fut_rain_sum=fut_sum,
+                d_p10=d_p10_rel,
+                d_p50=d_p50_rel,
+                d_p90=d_p90_rel,
+                pad_dry_mm=float(m_h.get("pad_dry_mm", 0.0)),
+            )
 
             obs_conf = str(now_row.get("rain_source", "club")) != "open_meteo"
             d_p10_c, d_p50_c, d_p90_c = self._apply_hydrological_guardrails(
@@ -1185,15 +1235,18 @@ class OFD1ForecastEngine:
         for h in [1, 2, 3, 6, 12, 18, 24]:
             work_h = self._attach_horizon_future_cols(sim_feat, h)
             f_cols = CAUSAL_COLS + nwp_cols_for_horizon(h)
+            if self.model_version in {"v1", "v2"} and "era5_soil_moisture" in work_h.columns:
+                f_cols = f_cols + ["era5_soil_moisture"]
             x_row = work_h.loc[[now_ts], f_cols].copy()
             # Scale raw rain inputs by antecedent peat runoff efficiency (sponge effect when dry vs conduit when wet)
             runoff_eff = float(np.clip((moist_frac / 0.75) ** 1.6, 0.12, 1.45))
             for col in x_row.columns:
                 if "rain" in col or "tank_6h" in col or "tank_24h" in col:
                     x_row[col] = x_row[col] * runoff_eff
-            d50 = float(self.models[h]["p50"].predict(x_row)[0]) * runoff_eff
-            d10 = float(self.models[h]["p10"].predict(x_row)[0]) * runoff_eff
-            d90 = float(self.models[h]["p90"].predict(x_row)[0]) * runoff_eff
+            m_h = self.models[h]
+            d50 = float(m_h["p50"].predict(self._select_model_X(m_h["p50"], x_row))[0]) * runoff_eff
+            d10 = float(m_h["p10"].predict(self._select_model_X(m_h["p10"], x_row))[0]) * runoff_eff
+            d90 = float(m_h["p90"].predict(self._select_model_X(m_h["p90"], x_row))[0]) * runoff_eff
             peat_boost = max(
                 0.0, (rain_6h_mm * (moist_frac**1.8) * 18.0) * np.exp(-((h - 6.0) ** 2) / 30.0)
             )
@@ -1328,79 +1381,202 @@ class OFD1ForecastEngine:
                 TRAIN_SPLIT_UTC,
             )
             ledger_chunks = []
+            ref_rain_s = df_feat["rain_mm"].fillna(df_feat["fused_rain_mm"]).fillna(0.0)
+
+            nwp_2026_idx = pd.DatetimeIndex([], tz="UTC")
+            p10_r = p50_r = p90_r = np.empty((0, 48), dtype=float)
+            valid_causal = pd.DataFrame()
+            include_legacy = self.model_version in {"v1", "v2"}
+            if not self.df_nwp_archive.empty:
+                valid_causal = df_feat.dropna(subset=["depth_mm"] + CAUSAL_COLS).sort_index()
+                if not valid_causal.empty:
+                    arch_end = min(
+                        valid_causal.index.max(),
+                        self.df_nwp_archive.index.max() - pd.Timedelta(hours=48),
+                    )
+                    if arch_end >= TRAIN_SPLIT_UTC:
+                        nwp_2026_idx = valid_causal.loc[TRAIN_SPLIT_UTC:arch_end].index
+                        if len(nwp_2026_idx) > 0:
+                            _, p10_r, p50_r, p90_r, _, _ = build_archived_nwp_trajectories(
+                                self.df_nwp_archive, valid_causal, nwp_2026_idx
+                            )
 
             for h in ledger_horizons:
                 work_h = self._attach_horizon_future_cols(df_feat, h)
                 f_cols = CAUSAL_COLS + nwp_cols_for_horizon(h)
+                if include_legacy and "era5_soil_moisture" in work_h.columns:
+                    f_cols = f_cols + ["era5_soil_moisture"]
                 sub = work_h.dropna(subset=["depth_mm", "ddepth_1h", "ddepth_24h"] + f_cols).copy()
-                if sub.empty:
-                    continue
+                if len(nwp_2026_idx) > 0 and not sub.empty:
+                    sub = sub[~sub.index.isin(nwp_2026_idx)]
 
-                X_sub = sub[f_cols]
-                base_d = sub["depth_mm"].values
-                d10 = self.models[h]["p10"].predict(X_sub)
-                d50 = self.models[h]["p50"].predict(X_sub)
-                d90 = self.models[h]["p90"].predict(X_sub)
+                m_h = self.models[h]
+                pad_dry = float(m_h.get("pad_dry_mm", 0.0))
 
-                fused_3h = (
-                    sub["fused_rain_sum_3h"].values
-                    if "fused_rain_sum_3h" in sub
-                    else np.zeros(len(sub))
-                )
-                fut_sum = (
-                    sub["fut_rain_sum_6h_at_target"].values
-                    if "fut_rain_sum_6h_at_target" in sub
-                    else np.zeros(len(sub))
-                )
-                moist_idx = (
-                    sub["moisture_index"].values
-                    if "moisture_index" in sub
-                    else np.full(len(sub), 0.5)
-                )
-                t_168 = sub["tank_168h"].values if "tank_168h" in sub else np.full(len(sub), 0.5)
-                dd_1h = sub["ddepth_1h"].values if "ddepth_1h" in sub else np.zeros(len(sub))
+                if not sub.empty:
+                    cum_fut_s = (
+                        ref_rain_s.iloc[::-1].rolling(h, min_periods=1).sum().iloc[::-1].shift(-1).fillna(0.0)
+                    )
+                    X_sub = sub[f_cols]
+                    base_d = sub["depth_mm"].values
+                    d10 = m_h["p10"].predict(self._select_model_X(m_h["p10"], X_sub))
+                    d50 = m_h["p50"].predict(self._select_model_X(m_h["p50"], X_sub))
+                    d90 = m_h["p90"].predict(self._select_model_X(m_h["p90"], X_sub))
 
-                d10_c, d50_c, d90_c = self._apply_hydrological_guardrails(
-                    base_depth=base_d,
-                    ddepth_1h=dd_1h,
-                    fused_rain_3h=fused_3h,
-                    moisture_index=moist_idx,
-                    tank_168h=t_168,
-                    horizon_h=h,
-                    fut_rain_sum=fut_sum,
-                    d_p10=d10,
-                    d_p50=d50,
-                    d_p90=d90,
-                )
+                    fused_3h = (
+                        sub["fused_rain_sum_3h"].values
+                        if "fused_rain_sum_3h" in sub
+                        else np.zeros(len(sub))
+                    )
+                    fut_sum = cum_fut_s.loc[sub.index].values
+                    obs_conf = (
+                        sub["rain_source"].values != "open_meteo"
+                        if "rain_source" in sub.columns
+                        else True
+                    )
+                    moist_idx = (
+                        sub["moisture_index"].values
+                        if "moisture_index" in sub
+                        else np.full(len(sub), 0.5)
+                    )
+                    t_168 = sub["tank_168h"].values if "tank_168h" in sub else np.full(len(sub), 0.5)
+                    dd_1h = sub["ddepth_1h"].values if "ddepth_1h" in sub else np.zeros(len(sub))
 
-                p10, p50, p90 = reconstruct_depth_quantiles(
-                    base_depth=base_d,
-                    d_p10_c=d10_c,
-                    d_p50_c=d50_c,
-                    d_p90_c=d90_c,
-                )
+                    d10, d50, d90 = apply_dry_conformal_padding(
+                        base_depth=base_d,
+                        ddepth_1h=dd_1h,
+                        fut_rain_sum=fut_sum,
+                        d_p10=d10,
+                        d_p50=d50,
+                        d_p90=d90,
+                        pad_dry_mm=pad_dry,
+                    )
 
-                issued_idx = sub.index
-                target_idx = issued_idx + pd.Timedelta(hours=h)
-                sources = np.where(
-                    target_idx < TRAIN_SPLIT_UTC, "train_in_sample", "test_out_of_sample"
-                )
+                    d10_c, d50_c, d90_c = self._apply_hydrological_guardrails(
+                        base_depth=base_d,
+                        ddepth_1h=dd_1h,
+                        fused_rain_3h=fused_3h,
+                        moisture_index=moist_idx,
+                        tank_168h=t_168,
+                        horizon_h=h,
+                        fut_rain_sum=fut_sum,
+                        d_p10=d10,
+                        d_p50=d50,
+                        d_p90=d90,
+                        obs_rain_confirmed=obs_conf,
+                    )
 
-                chunk = pd.DataFrame(
-                    {
-                        "issued_at": issued_idx,
-                        "target_timestamp": target_idx,
-                        "horizon_h": h,
-                        "start_depth_mm": np.round(base_d, 1),
-                        "pred_p10_mm": np.round(p10, 1),
-                        "pred_p50_mm": np.round(p50, 1),
-                        "pred_p90_mm": np.round(p90, 1),
-                        "actual_depth_mm": np.nan,
-                        "rain_mm": np.nan,
-                        "source": sources,
-                    }
-                )
-                ledger_chunks.append(chunk)
+                    p10, p50, p90 = reconstruct_depth_quantiles(
+                        base_depth=base_d,
+                        d_p10_c=d10_c,
+                        d_p50_c=d50_c,
+                        d_p90_c=d90_c,
+                    )
+
+                    issued_idx = sub.index
+                    target_idx = issued_idx + pd.Timedelta(hours=h)
+                    sources = np.where(
+                        target_idx < TRAIN_SPLIT_UTC, "train_in_sample", "test_out_of_sample"
+                    )
+
+                    ledger_chunks.append(
+                        pd.DataFrame(
+                            {
+                                "issued_at": issued_idx,
+                                "target_timestamp": target_idx,
+                                "horizon_h": h,
+                                "start_depth_mm": np.round(base_d, 1),
+                                "pred_p10_mm": np.round(p10, 1),
+                                "pred_p50_mm": np.round(p50, 1),
+                                "pred_p90_mm": np.round(p90, 1),
+                                "actual_depth_mm": np.nan,
+                                "rain_mm": np.nan,
+                                "source": sources,
+                            }
+                        )
+                    )
+
+                if len(nwp_2026_idx) > 0:
+                    X_p10 = roll_future_features_for_horizon(
+                        valid_causal, nwp_2026_idx, p10_r, h, include_legacy_cols=include_legacy
+                    )
+                    X_p50 = roll_future_features_for_horizon(
+                        valid_causal, nwp_2026_idx, p50_r, h, include_legacy_cols=include_legacy
+                    )
+                    X_p90 = roll_future_features_for_horizon(
+                        valid_causal, nwp_2026_idx, p90_r, h, include_legacy_cols=include_legacy
+                    )
+                    d_p50 = m_h["p50"].predict(self._select_model_X(m_h["p50"], X_p50))
+                    d_p10_on_p50 = m_h["p10"].predict(self._select_model_X(m_h["p10"], X_p50))
+                    d_p50_on_p10 = m_h["p50"].predict(self._select_model_X(m_h["p50"], X_p10))
+                    d_p90_on_p50 = m_h["p90"].predict(self._select_model_X(m_h["p90"], X_p50))
+                    d_p90_on_p90 = m_h["p90"].predict(self._select_model_X(m_h["p90"], X_p90))
+                    d_p50_on_p90 = m_h["p50"].predict(self._select_model_X(m_h["p50"], X_p90))
+
+                    d10_rel, d50_rel, d90_rel, _ = combine_ensemble_quantile_deltas(
+                        d_p50=d_p50,
+                        d_p10_on_p50=d_p10_on_p50,
+                        d_p50_on_p10=d_p50_on_p10,
+                        d_p90_on_p50=d_p90_on_p50,
+                        d_p90_on_p90=d_p90_on_p90,
+                        d_p50_on_p90=d_p50_on_p90,
+                    )
+                    base_2026 = valid_causal.loc[nwp_2026_idx, "depth_mm"].values
+                    dd1_2026 = valid_causal.loc[nwp_2026_idx, "ddepth_1h"].values
+                    fused3_2026 = valid_causal.loc[nwp_2026_idx, "fused_rain_sum_3h"].values
+                    moist_2026 = valid_causal.loc[nwp_2026_idx, "moisture_index"].values
+                    t168_2026 = valid_causal.loc[nwp_2026_idx, "tank_168h"].values
+                    fut_sum_2026 = p50_r[:, :h].sum(axis=1)
+                    d10_rel, d50_rel, d90_rel = apply_dry_conformal_padding(
+                        base_depth=base_2026,
+                        ddepth_1h=dd1_2026,
+                        fut_rain_sum=fut_sum_2026,
+                        d_p10=d10_rel,
+                        d_p50=d50_rel,
+                        d_p90=d90_rel,
+                        pad_dry_mm=pad_dry,
+                    )
+                    obs_conf_2026 = (
+                        valid_causal.loc[nwp_2026_idx, "rain_source"].values != "open_meteo"
+                        if "rain_source" in valid_causal.columns
+                        else True
+                    )
+                    d10_c26, d50_c26, d90_c26 = self._apply_hydrological_guardrails(
+                        base_depth=base_2026,
+                        ddepth_1h=dd1_2026,
+                        fused_rain_3h=fused3_2026,
+                        moisture_index=moist_2026,
+                        tank_168h=t168_2026,
+                        horizon_h=h,
+                        fut_rain_sum=fut_sum_2026,
+                        d_p10=d10_rel,
+                        d_p50=d50_rel,
+                        d_p90=d90_rel,
+                        obs_rain_confirmed=obs_conf_2026,
+                    )
+                    p10_26, p50_26, p90_26 = reconstruct_depth_quantiles(
+                        base_depth=base_2026,
+                        d_p10_c=d10_c26,
+                        d_p50_c=d50_c26,
+                        d_p90_c=d90_c26,
+                    )
+                    target_26 = nwp_2026_idx + pd.Timedelta(hours=h)
+                    ledger_chunks.append(
+                        pd.DataFrame(
+                            {
+                                "issued_at": nwp_2026_idx,
+                                "target_timestamp": target_26,
+                                "horizon_h": h,
+                                "start_depth_mm": np.round(base_2026, 1),
+                                "pred_p10_mm": np.round(p10_26, 1),
+                                "pred_p50_mm": np.round(p50_26, 1),
+                                "pred_p90_mm": np.round(p90_26, 1),
+                                "actual_depth_mm": np.nan,
+                                "rain_mm": np.nan,
+                                "source": "test_out_of_sample",
+                            }
+                        )
+                    )
 
             df_ledger = pd.concat(ledger_chunks, ignore_index=True)
         else:
@@ -1424,30 +1600,44 @@ class OFD1ForecastEngine:
                         len(gap_hours),
                     )
                     catchup_chunks = []
+                    ref_rain_s = df_feat["rain_mm"].fillna(df_feat["fused_rain_mm"]).fillna(0.0)
+                    include_legacy = self.model_version in {"v1", "v2"}
                     for h in ledger_horizons:
                         work_h = self._attach_horizon_future_cols(df_feat, h)
                         f_cols = CAUSAL_COLS + nwp_cols_for_horizon(h)
+                        if include_legacy and "era5_soil_moisture" in work_h.columns:
+                            f_cols = f_cols + ["era5_soil_moisture"]
                         sub_gap = work_h.loc[
                             work_h.index.isin(gap_hours)
                         ].dropna(subset=["depth_mm", "ddepth_1h", "ddepth_24h"] + f_cols).copy()
                         if sub_gap.empty:
                             continue
 
+                        cum_fut_s = (
+                            ref_rain_s.iloc[::-1]
+                            .rolling(h, min_periods=1)
+                            .sum()
+                            .iloc[::-1]
+                            .shift(-1)
+                            .fillna(0.0)
+                        )
                         X_sub = sub_gap[f_cols]
                         base_d = sub_gap["depth_mm"].values
-                        d10 = self.models[h]["p10"].predict(X_sub)
-                        d50 = self.models[h]["p50"].predict(X_sub)
-                        d90 = self.models[h]["p90"].predict(X_sub)
+                        m_h = self.models[h]
+                        d10 = m_h["p10"].predict(self._select_model_X(m_h["p10"], X_sub))
+                        d50 = m_h["p50"].predict(self._select_model_X(m_h["p50"], X_sub))
+                        d90 = m_h["p90"].predict(self._select_model_X(m_h["p90"], X_sub))
 
                         fused_3h = (
                             sub_gap["fused_rain_sum_3h"].values
                             if "fused_rain_sum_3h" in sub_gap
                             else np.zeros(len(sub_gap))
                         )
-                        fut_sum = (
-                            sub_gap["fut_rain_sum_6h_at_target"].values
-                            if "fut_rain_sum_6h_at_target" in sub_gap
-                            else np.zeros(len(sub_gap))
+                        fut_sum = cum_fut_s.loc[sub_gap.index].values
+                        obs_conf = (
+                            sub_gap["rain_source"].values != "open_meteo"
+                            if "rain_source" in sub_gap.columns
+                            else True
                         )
                         moist_idx = (
                             sub_gap["moisture_index"].values
@@ -1465,6 +1655,16 @@ class OFD1ForecastEngine:
                             else np.zeros(len(sub_gap))
                         )
 
+                        d10, d50, d90 = apply_dry_conformal_padding(
+                            base_depth=base_d,
+                            ddepth_1h=dd_1h,
+                            fut_rain_sum=fut_sum,
+                            d_p10=d10,
+                            d_p50=d50,
+                            d_p90=d90,
+                            pad_dry_mm=float(m_h.get("pad_dry_mm", 0.0)),
+                        )
+
                         d10_c, d50_c, d90_c = self._apply_hydrological_guardrails(
                             base_depth=base_d,
                             ddepth_1h=dd_1h,
@@ -1476,6 +1676,7 @@ class OFD1ForecastEngine:
                             d_p10=d10,
                             d_p50=d50,
                             d_p90=d90,
+                            obs_rain_confirmed=obs_conf,
                         )
 
                         p10, p50, p90 = reconstruct_depth_quantiles(

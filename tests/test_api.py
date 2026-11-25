@@ -132,13 +132,18 @@ def test_verification_and_nwp_backtest_endpoints(api_client: TestClient) -> None
 
 
 def test_model_version_selection(monkeypatch) -> None:
-    """Verify OFD1_MODEL_VERSION selects v2 by default and supports v1 rollback."""
+    """Verify OFD1_MODEL_VERSION selects v3 by default and supports v2/v1 rollback."""
     from app.engine import OFD1ForecastEngine
 
     monkeypatch.delenv("OFD1_MODEL_VERSION", raising=False)
     eng_default = OFD1ForecastEngine(data_dir="data", read_only=True)
-    assert eng_default.model_version == "v2"
-    assert eng_default.models_path.name == "ofd1_models_v2.joblib"
+    assert eng_default.model_version == "v3"
+    assert eng_default.models_path.name == "ofd1_models_v3.joblib"
+
+    monkeypatch.setenv("OFD1_MODEL_VERSION", "v2")
+    eng_v2 = OFD1ForecastEngine(data_dir="data", read_only=True)
+    assert eng_v2.model_version == "v2"
+    assert eng_v2.models_path.name == "ofd1_models_v2.joblib"
 
     monkeypatch.setenv("OFD1_MODEL_VERSION", "v1")
     eng_v1 = OFD1ForecastEngine(data_dir="data", read_only=True)

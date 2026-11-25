@@ -39,6 +39,7 @@ from app.hydrology import (
     NWP_MODELS,
     RED_DEPTH_MM,
     TRAIN_SPLIT_UTC,
+    apply_dry_conformal_padding,
     apply_hydrological_guardrails,
     build_archived_nwp_trajectories,
     combine_ensemble_quantile_deltas,
@@ -53,7 +54,7 @@ FINGERPRINT_FILES: tuple[str, ...] = (
     "app/hydrology.py",
     "app/engine.py",
     "scripts/backtest_nwp_ensemble.py",
-    "data/ofd1_models_v2.joblib",
+    "data/ofd1_models_v3.joblib",
     "data/ofd1_aligned_hourly.parquet",
     "data/ofd1_nwp_archive.parquet",
 )
@@ -96,9 +97,12 @@ def _roll_future_features_for_horizon(
     issue_idx: pd.DatetimeIndex,
     fut_rain_mat: np.ndarray,
     h: int,
+    include_legacy_cols: bool = False,
 ) -> pd.DataFrame:
     """Delegate future feature rolling to app.hydrology.roll_future_features_for_horizon."""
-    return roll_future_features_for_horizon(valid_obs, issue_idx, fut_rain_mat, h)
+    return roll_future_features_for_horizon(
+        valid_obs, issue_idx, fut_rain_mat, h, include_legacy_cols=include_legacy_cols
+    )
 
 
 def _binary_f1(pred: pd.Series | np.ndarray, obs: pd.Series | np.ndarray) -> float:
@@ -159,10 +163,32 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         out["f1_600_p90"] = _binary_f1(g["p90_600"], obs_600)
         out["f1_700_p50"] = _binary_f1(g["p50_red"], obs_red)
         out["f1_700_p90"] = _binary_f1(g["p90_red"], obs_red)
+
+        flood_g = g[obs_red]
+        out["flood_rmse_p50_mm"] = (
+            float(np.sqrt(flood_g["sq_err"].mean())) if len(flood_g) else np.nan
+        )
+        out["flood_bias_p50_mm"] = float(flood_g["err"].mean()) if len(flood_g) else np.nan
+        below_red_t0 = g["start_depth_mm"] < RED_DEPTH_MM
+        cross_red = below_red_t0 & obs_red
+        n_cross = int(cross_red.sum())
+        out["cross_red_n"] = n_cross
+        out["cross_red_rmse_p50_mm"] = (
+            float(np.sqrt(g.loc[cross_red, "sq_err"].mean())) if n_cross else np.nan
+        )
+        out["cross_red_p50_pod_pct"] = (
+            100.0 * float((g["p50_red"] & cross_red).sum()) / max(1, n_cross)
+        )
+        out["cross_red_p90_pod_pct"] = (
+            100.0 * float((g["p90_red"] & cross_red).sum()) / max(1, n_cross)
+        )
+        out["cross_red_p50_f1"] = _binary_f1(
+            g.loc[below_red_t0, "p50_red"], g.loc[below_red_t0, "obs_red"]
+        )
         return pd.Series(out)
 
     summ = df.groupby(["horizon_h", "scenario"]).apply(_agg, include_groups=False).reset_index()
-    f1_cols = ["f1_600_p50", "f1_600_p90", "f1_700_p50", "f1_700_p90"]
+    f1_cols = ["f1_600_p50", "f1_600_p90", "f1_700_p50", "f1_700_p90", "cross_red_p50_f1"]
     other_float_cols = [
         c for c in summ.select_dtypes(include=[np.floating, float]).columns if c not in f1_cols
     ]
@@ -175,6 +201,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         "p90_red_misses",
         "p50_red_false_alarms",
         "p50_red_misses",
+        "cross_red_n",
     ):
         if int_col in summ.columns:
             summ[int_col] = summ[int_col].astype(int)
@@ -224,23 +251,55 @@ def run_backtest(
         if "ddepth_1h" in valid_obs.columns
         else np.zeros(len(issue_idx))
     )
+    obs_conf = (
+        valid_obs.loc[issue_idx, "rain_source"].values != "open_meteo"
+        if "rain_source" in valid_obs.columns
+        else True
+    )
 
     chunks = []
+    include_legacy = eng.model_version in {"v1", "v2"}
+
+    def _sel_x(est: Any, x_df: pd.DataFrame) -> pd.DataFrame:
+        if hasattr(est, "feature_names_in_"):
+            return x_df[list(est.feature_names_in_)]
+        return x_df
+
     for h in eval_h:
-        X_det = _roll_future_features_for_horizon(valid_obs, issue_idx, det_r, h)
-        X_p10 = _roll_future_features_for_horizon(valid_obs, issue_idx, p10_r, h)
-        X_p50 = _roll_future_features_for_horizon(valid_obs, issue_idx, p50_r, h)
-        X_p90 = _roll_future_features_for_horizon(valid_obs, issue_idx, p90_r, h)
-        X_perf = _roll_future_features_for_horizon(valid_obs, issue_idx, perf_r, h)
+        X_det = _roll_future_features_for_horizon(
+            valid_obs, issue_idx, det_r, h, include_legacy_cols=include_legacy
+        )
+        X_p10 = _roll_future_features_for_horizon(
+            valid_obs, issue_idx, p10_r, h, include_legacy_cols=include_legacy
+        )
+        X_p50 = _roll_future_features_for_horizon(
+            valid_obs, issue_idx, p50_r, h, include_legacy_cols=include_legacy
+        )
+        X_p90 = _roll_future_features_for_horizon(
+            valid_obs, issue_idx, p90_r, h, include_legacy_cols=include_legacy
+        )
+        X_perf = _roll_future_features_for_horizon(
+            valid_obs, issue_idx, perf_r, h, include_legacy_cols=include_legacy
+        )
 
         m = eng.models[h]
+        pad_dry = float(m.get("pad_dry_mm", 0.0))
         target_idx = issue_idx + pd.Timedelta(hours=h)
         act_d = valid_obs["depth_mm"].reindex(target_idx).values
 
-        # 1. Deterministic NWP (hydrological P10-P90 with physical guardrails)
-        d50_det = m["p50"].predict(X_det)
-        d10_det = m["p10"].predict(X_det)
-        d90_det = m["p90"].predict(X_det)
+        # 1. Deterministic NWP (hydrological P10-P90 with dry CQR padding + physical guardrails)
+        d50_det = m["p50"].predict(_sel_x(m["p50"], X_det))
+        d10_det = m["p10"].predict(_sel_x(m["p10"], X_det))
+        d90_det = m["p90"].predict(_sel_x(m["p90"], X_det))
+        d10_det, d50_det, d90_det = apply_dry_conformal_padding(
+            base_depth=base_d,
+            ddepth_1h=dd_1h,
+            fut_rain_sum=det_r[:, :h].sum(axis=1),
+            d_p10=d10_det,
+            d_p50=d50_det,
+            d_p90=d90_det,
+            pad_dry_mm=pad_dry,
+        )
         d10_det_c, d50_det_c, d90_det_c = apply_hydrological_guardrails(
             base_depth=base_d,
             ddepth_1h=dd_1h,
@@ -248,10 +307,11 @@ def run_backtest(
             moisture_index=moist_idx,
             tank_168h=t_168,
             horizon_h=h,
-            fut_rain_sum=X_det["fut_rain_sum_6h_at_target"].values,
+            fut_rain_sum=det_r[:, :h].sum(axis=1),
             d_p10=d10_det,
             d_p50=d50_det,
             d_p90=d90_det,
+            obs_rain_confirmed=obs_conf,
         )
         p10_det, p50_det, p90_det = reconstruct_depth_quantiles(
             base_depth=base_d,
@@ -260,13 +320,13 @@ def run_backtest(
             d_p90_c=d90_det_c,
         )
 
-        # 2. 6-Model NWP Ensemble (quadrature combination + physical guardrails matching _forecast_anchors)
-        d_p50 = m["p50"].predict(X_p50)
-        d_p10_on_p50 = m["p10"].predict(X_p50)
-        d_p50_on_p10 = m["p50"].predict(X_p10)
-        d_p90_on_p50 = m["p90"].predict(X_p50)
-        d_p90_on_p90 = m["p90"].predict(X_p90)
-        d_p50_on_p90 = m["p50"].predict(X_p90)
+        # 2. 6-Model NWP Ensemble (quadrature combination + dry CQR padding + physical guardrails)
+        d_p50 = m["p50"].predict(_sel_x(m["p50"], X_p50))
+        d_p10_on_p50 = m["p10"].predict(_sel_x(m["p10"], X_p50))
+        d_p50_on_p10 = m["p50"].predict(_sel_x(m["p50"], X_p10))
+        d_p90_on_p50 = m["p90"].predict(_sel_x(m["p90"], X_p50))
+        d_p90_on_p90 = m["p90"].predict(_sel_x(m["p90"], X_p90))
+        d_p50_on_p90 = m["p50"].predict(_sel_x(m["p50"], X_p90))
 
         d10_rel, d50_rel, d90_rel, _ = combine_ensemble_quantile_deltas(
             d_p50=d_p50,
@@ -276,6 +336,15 @@ def run_backtest(
             d_p90_on_p90=d_p90_on_p90,
             d_p50_on_p90=d_p50_on_p90,
         )
+        d10_rel, d50_rel, d90_rel = apply_dry_conformal_padding(
+            base_depth=base_d,
+            ddepth_1h=dd_1h,
+            fut_rain_sum=p50_r[:, :h].sum(axis=1),
+            d_p10=d10_rel,
+            d_p50=d50_rel,
+            d_p90=d90_rel,
+            pad_dry_mm=pad_dry,
+        )
         d10_ens_c, d50_ens_c, d90_ens_c = apply_hydrological_guardrails(
             base_depth=base_d,
             ddepth_1h=dd_1h,
@@ -283,10 +352,11 @@ def run_backtest(
             moisture_index=moist_idx,
             tank_168h=t_168,
             horizon_h=h,
-            fut_rain_sum=X_p50["fut_rain_sum_6h_at_target"].values,
+            fut_rain_sum=p50_r[:, :h].sum(axis=1),
             d_p10=d10_rel,
             d_p50=d50_rel,
             d_p90=d90_rel,
+            obs_rain_confirmed=obs_conf,
         )
         p10_ens, p50_ens, p90_ens = reconstruct_depth_quantiles(
             base_depth=base_d,
@@ -295,10 +365,19 @@ def run_backtest(
             d_p90_c=d90_ens_c,
         )
 
-        # 3. Perfect Wx reference (with physical guardrails)
-        d50_pf = m["p50"].predict(X_perf)
-        d10_pf = m["p10"].predict(X_perf)
-        d90_pf = m["p90"].predict(X_perf)
+        # 3. Perfect Wx reference (with dry CQR padding + physical guardrails)
+        d50_pf = m["p50"].predict(_sel_x(m["p50"], X_perf))
+        d10_pf = m["p10"].predict(_sel_x(m["p10"], X_perf))
+        d90_pf = m["p90"].predict(_sel_x(m["p90"], X_perf))
+        d10_pf, d50_pf, d90_pf = apply_dry_conformal_padding(
+            base_depth=base_d,
+            ddepth_1h=dd_1h,
+            fut_rain_sum=perf_r[:, :h].sum(axis=1),
+            d_p10=d10_pf,
+            d_p50=d50_pf,
+            d_p90=d90_pf,
+            pad_dry_mm=pad_dry,
+        )
         d10_pf_c, d50_pf_c, d90_pf_c = apply_hydrological_guardrails(
             base_depth=base_d,
             ddepth_1h=dd_1h,
@@ -306,10 +385,11 @@ def run_backtest(
             moisture_index=moist_idx,
             tank_168h=t_168,
             horizon_h=h,
-            fut_rain_sum=X_perf["fut_rain_sum_6h_at_target"].values,
+            fut_rain_sum=perf_r[:, :h].sum(axis=1),
             d_p10=d10_pf,
             d_p50=d50_pf,
             d_p90=d90_pf,
+            obs_rain_confirmed=obs_conf,
         )
         p10_pf, p50_pf, p90_pf = reconstruct_depth_quantiles(
             base_depth=base_d,
@@ -360,6 +440,9 @@ def _extract_ledger_metrics(summary_df: pd.DataFrame) -> dict[str, dict[str, dic
         "f1_600_p90",
         "f1_700_p50",
         "f1_700_p90",
+        "flood_rmse_p50_mm",
+        "cross_red_p50_pod_pct",
+        "cross_red_p90_pod_pct",
     ]
     for scen in ("ensemble", "deterministic"):
         sub = summary_df[summary_df["scenario"] == scen]
@@ -427,6 +510,17 @@ def verify_or_update_skill_ledger(
                         f"{scen} +{h_key}h F1@700(P90) regressed: {c_vals['f1_700_p90']:.4f} < "
                         f"{b_vals['f1_700_p90']:.4f} - {tolerances['max_f1_regression']}"
                     )
+                if int(h_key) >= 6:
+                    if "flood_rmse_p50_mm" in b_vals and c_vals["flood_rmse_p50_mm"] > b_vals["flood_rmse_p50_mm"] + tolerances.get("max_flood_rmse_regression_mm", 2.0):
+                        failures.append(
+                            f"{scen} +{h_key}h Flood RMSE regressed: {c_vals['flood_rmse_p50_mm']:.2f} > "
+                            f"{b_vals['flood_rmse_p50_mm']:.2f} + {tolerances.get('max_flood_rmse_regression_mm', 2.0)}"
+                        )
+                    if "cross_red_p50_pod_pct" in b_vals and c_vals["cross_red_p50_pod_pct"] < b_vals["cross_red_p50_pod_pct"] - tolerances.get("max_cross_red_pod_regression_pct", 2.5):
+                        failures.append(
+                            f"{scen} +{h_key}h CrossRed P50 POD regressed: {c_vals['cross_red_p50_pod_pct']:.2f}% < "
+                            f"{b_vals['cross_red_p50_pod_pct']:.2f}% - {tolerances.get('max_cross_red_pod_regression_pct', 2.5)}%"
+                        )
         if failures:
             raise AssertionError("Forecast skill regression gate failed:\n  - " + "\n  - ".join(failures))
     elif not update:
@@ -509,7 +603,15 @@ def main() -> None:
     # Fast path for --verify-ledger --read-only when summary CSV already exists and fingerprint matches
     if args.verify_ledger and args.read_only and not args.update_ledger and summary_csv_path.exists():
         summ = pd.read_csv(summary_csv_path)
-        expected_cols = {"rmse_p50_mm", "f1_600_p50", "f1_600_p90", "f1_700_p50", "f1_700_p90"}
+        expected_cols = {
+            "rmse_p50_mm",
+            "f1_600_p50",
+            "f1_600_p90",
+            "f1_700_p50",
+            "f1_700_p90",
+            "flood_rmse_p50_mm",
+            "cross_red_p50_pod_pct",
+        }
         if expected_cols.issubset(set(summ.columns)) and set(EVAL_HORIZONS).issubset(
             set(summ["horizon_h"].astype(int).unique())
         ):

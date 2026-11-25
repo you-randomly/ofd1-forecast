@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -48,7 +49,6 @@ CAUSAL_COLS = (
         "ddepth_24h",
         "accel_1h",
         "moisture_index",
-        "era5_soil_moisture",
         "era5_soil_deep",
         "tank_3h",
         "tank_6h",
@@ -81,6 +81,8 @@ def nwp_cols_for_horizon(h: int) -> list[str]:
         "fut_rain_sum_6h_at_target",
         "fut_rain_sum_12h_at_target",
         "fut_eff_rain_sum_6h_at_target",
+        "fut_rain_sum_total_h",
+        "fut_rain_early_h",
     ]
     for k in range(min(h, 6)):
         cols.append(f"fut_rain_minus_{k}h_from_target")
@@ -134,7 +136,17 @@ def engineer_features(df_in: pd.DataFrame) -> pd.DataFrame:
         hydro_nwp_agree = (df["ddepth_3h"].fillna(0.0) >= 10.0) & (
             df["rain_mm"].fillna(0.0).rolling(6, min_periods=1).sum() >= 1.0
         )
-        return flat_6h & (peer_rain | hydro_nwp_agree)
+        ref_1h = pd.concat([peer, df["rain_mm"]], axis=1).max(axis=1).fillna(0.0)
+        valid_cnt_72h = series.notna().astype(float).rolling(72, min_periods=24).sum()
+        ref_72h = ref_1h.where(series.notna(), 0.0).rolling(72, min_periods=24).sum()
+        series_72h = series.fillna(0.0).rolling(72, min_periods=24).sum()
+        partial_clog = (
+            series.notna()
+            & (valid_cnt_72h >= 24)
+            & (ref_72h >= 15.0)
+            & (series_72h < 0.25 * ref_72h)
+        )
+        return (flat_6h & (peer_rain | hydro_nwp_agree)) | partial_clog
 
     stump_peer = pd.concat([swcc_clean, nrw_clean], axis=1).max(axis=1)
     swcc_peer = pd.concat([stump_clean, nrw_clean], axis=1).max(axis=1)
@@ -207,19 +219,26 @@ def engineer_features(df_in: pd.DataFrame) -> pd.DataFrame:
         df[f"tank_{hl}h"] = net_rain.ewm(alpha=alpha, adjust=False).mean()
         df[f"ref_tank_{hl}h"] = rain_ref.ewm(alpha=alpha, adjust=False).mean()
 
-    soil_min = df["era5_soil_moisture"].expanding(min_periods=48).min().fillna(0.30)
-    soil_max = df["era5_soil_moisture"].expanding(min_periods=48).max().fillna(0.43)
-    tank_168h_p95 = df["tank_168h"].expanding(min_periods=48).quantile(0.95).fillna(0.5)
+    soil_deep = (
+        df["era5_soil_deep"]
+        .ffill()
+        .fillna(df["era5_soil_moisture"].ffill())
+        .fillna(0.36)
+    )
+    soil_min = soil_deep.expanding(min_periods=48).min().fillna(0.25)
+    soil_max = soil_deep.expanding(min_periods=48).max().fillna(0.43)
+    tank_168h_p95 = df["ref_tank_168h"].expanding(min_periods=48).quantile(0.95).fillna(0.45)
     df["soil_min"] = soil_min
     df["soil_max"] = soil_max
     df["tank_168h_p95"] = tank_168h_p95
 
-    sat_norm = ((df["era5_soil_moisture"].ffill() - soil_min) / (soil_max - soil_min + 1e-6)).clip(
-        0.05, 1.0
-    )
-    tank_norm = (df["tank_168h"] / (tank_168h_p95 + 1e-6)).clip(0.05, 1.5)
-    df["moisture_index"] = (0.5 * sat_norm + 0.5 * tank_norm).fillna(0.5)
+    tank_norm = (df["ref_tank_168h"] / (tank_168h_p95 + 1e-6)).clip(0.05, 1.15)
+    sat_raw = ((soil_deep - soil_min) / (soil_max - soil_min + 1e-6)).clip(0.05, 1.0)
+    sat_norm = np.minimum(sat_raw, tank_norm + 0.25)
+    df["moisture_index"] = (0.35 * sat_norm + 0.65 * tank_norm).clip(0.05, 1.0).fillna(0.5)
     df["eff_rain_mm"] = df["fused_rain_wind_adj"] * (df["moisture_index"] ** 1.5)
+    df["ref_eff_rain_mm"] = rain_ref * (df["moisture_index"] ** 1.5)
+    df["ref_eff_rain_sum_6h"] = df["ref_eff_rain_mm"].rolling(6).sum()
 
     # 5. Rain lags & rolling sums
     for lag in range(7):
@@ -242,16 +261,19 @@ def engineer_features(df_in: pd.DataFrame) -> pd.DataFrame:
 
 
 def attach_horizon_future_cols(df: pd.DataFrame, h: int) -> pd.DataFrame:
-    """Attach target-time future rainfall and peat-tank features for horizon ``h``."""
+    """Attach target-time future rainfall and peat-tank features for horizon ``h`` with exact roll parity."""
     work = df.copy()
-    work["fut_ref_tank_6h"] = work["ref_tank_6h"].shift(-h)
-    work["fut_ref_tank_24h"] = work["tank_24h"].shift(-h)
-    work["fut_ref_tank_96h"] = work["ref_tank_96h"].shift(-h)
-    work["fut_rain_sum_6h_at_target"] = work["ref_rain_sum_6h"].shift(-h)
-    work["fut_rain_sum_12h_at_target"] = work["ref_rain_sum_12h"].shift(-h)
-    work["fut_eff_rain_sum_6h_at_target"] = work["eff_rain_sum_6h"].shift(-h)
-    for k in range(min(h, 6)):
-        work[f"fut_rain_minus_{k}h_from_target"] = work["rain_mm"].shift(-(h - k))
+    rain_ref = work["rain_mm"].fillna(work["fused_rain_mm"]).fillna(0.0)
+    fut_rain_mat = np.column_stack(
+        [
+            rain_ref.reindex(work.index + pd.Timedelta(hours=step), fill_value=0.0).values
+            for step in range(1, h + 1)
+        ]
+    )
+    nwp_cols = nwp_cols_for_horizon(h)
+    rolled = roll_future_features_for_horizon(work, work.index, fut_rain_mat, h)[nwp_cols]
+    for col in nwp_cols:
+        work[col] = rolled[col].values
     return work
 
 
@@ -294,7 +316,9 @@ def build_archived_nwp_trajectories(
     det_rain = np.where(np.isnan(stack[0]), np.nanmedian(stack, axis=0), stack[0])
     det_rain = np.nan_to_num(det_rain, nan=0.0)
 
-    rain_p10, rain_p50, rain_p90, spread_48h = compute_nwp_ensemble_quantiles(stack, det_rain)
+    rain_p10, rain_p50, rain_p90, spread_48h = compute_nwp_ensemble_quantiles(
+        stack, det_rain, model_names=NWP_MODELS
+    )
     perf_rain = obs_rain_s[grid_idx]
     return det_rain, rain_p10, rain_p50, rain_p90, perf_rain, spread_48h
 
@@ -304,64 +328,93 @@ def roll_future_features_for_horizon(
     issue_idx: pd.DatetimeIndex,
     fut_rain_mat: np.ndarray,
     h: int,
+    include_legacy_cols: bool = False,
 ) -> pd.DataFrame:
     """Compute exact CAUSAL_COLS + nwp_cols_for_horizon(h) at issue_idx for an (N, >=h) future rain matrix."""
-    sub = valid_obs.loc[issue_idx, CAUSAL_COLS].copy()
-    full_idx = valid_obs.index
-    base_pos = full_idx.get_indexer(issue_idx)
+    out_cols = list(CAUSAL_COLS)
+    if include_legacy_cols and "era5_soil_moisture" in valid_obs.columns:
+        out_cols = out_cols + ["era5_soil_moisture"]
+    sub = valid_obs.loc[issue_idx, out_cols].copy()
 
-    rain_obs_all = valid_obs["rain_mm"].fillna(valid_obs["fused_rain_mm"]).fillna(0.0).values
-    eff_obs_all = valid_obs["eff_rain_mm"].fillna(0.0).values
-    et0_t0 = valid_obs.loc[issue_idx, "et0_mm"].fillna(0.05).values
-    wind_t0 = valid_obs.loc[issue_idx, "wind_kmh"].fillna(15.0).values
-    wind_factor = 1.0 + 0.004 * np.clip(wind_t0 - 15.0, 0.0, None)
-    moist_t0 = valid_obs.loc[issue_idx, "moisture_index"].fillna(0.5).values
+    rain_s = valid_obs["rain_mm"].fillna(valid_obs["fused_rain_mm"]).fillna(0.0)
+    if "ref_eff_rain_mm" in valid_obs.columns:
+        eff_s = valid_obs["ref_eff_rain_mm"].fillna(0.0)
+    else:
+        eff_s = rain_s * (valid_obs["moisture_index"].fillna(0.5) ** 1.5)
+
+    past_12 = np.column_stack(
+        [rain_s.reindex(issue_idx - pd.Timedelta(hours=k), fill_value=0.0).values for k in range(11, -1, -1)]
+    )
+    past_6_eff = np.column_stack(
+        [eff_s.reindex(issue_idx - pd.Timedelta(hours=k), fill_value=0.0).values for k in range(5, -1, -1)]
+    )
 
     ref_tank_6 = valid_obs.loc[issue_idx, "ref_tank_6h"].values.astype(float).copy()
-    tank_24 = valid_obs.loc[issue_idx, "tank_24h"].values.astype(float).copy()
+    ref_tank_24 = valid_obs.loc[issue_idx, "ref_tank_24h"].values.astype(float).copy()
     ref_tank_96 = valid_obs.loc[issue_idx, "ref_tank_96h"].values.astype(float).copy()
+    ref_tank_168 = (
+        valid_obs.loc[issue_idx, "ref_tank_168h"].values.astype(float).copy()
+        if "ref_tank_168h" in valid_obs.columns
+        else valid_obs.loc[issue_idx, "tank_168h"].values.astype(float).copy()
+    )
+    rt95 = valid_obs.loc[issue_idx, "tank_168h_p95"].fillna(0.45).values.astype(float)
+    s_min = valid_obs.loc[issue_idx, "soil_min"].fillna(0.25).values.astype(float)
+    s_max = valid_obs.loc[issue_idx, "soil_max"].fillna(0.43).values.astype(float)
+    if "era5_soil_deep" in valid_obs.columns:
+        soil_deep_s = valid_obs.loc[issue_idx, "era5_soil_deep"]
+        if "era5_soil_moisture" in valid_obs.columns:
+            soil_deep_s = soil_deep_s.fillna(valid_obs.loc[issue_idx, "era5_soil_moisture"])
+        soil_deep_t0 = soil_deep_s.fillna(0.36).values.astype(float)
+    else:
+        soil_deep_t0 = np.full(len(issue_idx), 0.36, dtype=float)
+    sat_raw_t0 = np.clip((soil_deep_t0 - s_min) / (s_max - s_min + 1e-6), 0.05, 1.0)
 
     a6 = 1.0 - np.exp(-np.log(2) / 6.0)
     a24 = 1.0 - np.exp(-np.log(2) / 24.0)
     a96 = 1.0 - np.exp(-np.log(2) / 96.0)
+    a168 = 1.0 - np.exp(-np.log(2) / 168.0)
 
+    fut_eff_steps = np.empty((len(issue_idx), h), dtype=float)
     for step in range(h):
         r_step = fut_rain_mat[:, step]
-        net_step = np.clip(r_step - 0.8 * et0_t0, 0.0, None)
         ref_tank_6 = (1.0 - a6) * ref_tank_6 + a6 * r_step
-        tank_24 = (1.0 - a24) * tank_24 + a24 * net_step
+        ref_tank_24 = (1.0 - a24) * ref_tank_24 + a24 * r_step
         ref_tank_96 = (1.0 - a96) * ref_tank_96 + a96 * r_step
+        ref_tank_168 = (1.0 - a168) * ref_tank_168 + a168 * r_step
+        tn_step = np.clip(ref_tank_168 / (rt95 + 1e-6), 0.05, 1.15)
+        sn_step = np.minimum(sat_raw_t0, tn_step + 0.25)
+        m_step = np.clip(0.35 * sn_step + 0.65 * tn_step, 0.05, 1.0)
+        fut_eff_steps[:, step] = r_step * (m_step**1.5)
 
     sub["fut_ref_tank_6h"] = ref_tank_6
-    sub["fut_ref_tank_24h"] = tank_24
+    sub["fut_ref_tank_24h"] = ref_tank_24
     sub["fut_ref_tank_96h"] = ref_tank_96
 
-    past_12 = np.column_stack(
-        [rain_obs_all[np.maximum(0, base_pos - k)] for k in range(11, -1, -1)]
-    )
     comb_rain = np.hstack([past_12, fut_rain_mat[:, :h]])
     tgt_col = 11 + h
     sub["fut_rain_sum_6h_at_target"] = np.sum(comb_rain[:, tgt_col - 5 : tgt_col + 1], axis=1)
     sub["fut_rain_sum_12h_at_target"] = np.sum(comb_rain[:, tgt_col - 11 : tgt_col + 1], axis=1)
 
-    fut_eff_mat = (fut_rain_mat[:, :h] * wind_factor[:, None]) * (moist_t0[:, None] ** 1.5)
-    past_6_eff = np.column_stack(
-        [eff_obs_all[np.maximum(0, base_pos - k)] for k in range(5, -1, -1)]
-    )
-    comb_eff = np.hstack([past_6_eff, fut_eff_mat])
+    comb_eff = np.hstack([past_6_eff, fut_eff_steps])
     eff_tgt_col = 5 + h
     sub["fut_eff_rain_sum_6h_at_target"] = np.sum(
         comb_eff[:, eff_tgt_col - 5 : eff_tgt_col + 1], axis=1
+    )
+    sub["fut_rain_sum_total_h"] = np.sum(fut_rain_mat[:, :h], axis=1)
+    sub["fut_rain_early_h"] = (
+        np.sum(fut_rain_mat[:, : max(0, h - 6)], axis=1)
+        if h > 6
+        else np.zeros(len(issue_idx), dtype=float)
     )
 
     for k in range(min(h, 6)):
         sub[f"fut_rain_minus_{k}h_from_target"] = fut_rain_mat[:, h - 1 - k]
 
-    return sub[CAUSAL_COLS + nwp_cols_for_horizon(h)]
+    return sub[out_cols + nwp_cols_for_horizon(h)]
 
 
 def roll_future_moisture_series(now_row: pd.Series | dict[str, Any], fut_wx: pd.DataFrame) -> pd.Series:
-    """Roll tank_168h over future weather hours and normalize against full-history expanding bounds at t0."""
+    """Roll ref_tank_168h over future weather hours and normalize against full-history expanding bounds at t0."""
     n_hrs = len(fut_wx)
     if n_hrs == 0:
         return pd.Series([], index=fut_wx.index, dtype=float, name="moisture_index")
@@ -372,51 +425,56 @@ def roll_future_moisture_series(now_row: pd.Series | dict[str, Any], fut_wx: pd.
         if rain_col in fut_wx.columns
         else np.zeros(n_hrs, dtype=float)
     )
-    fut_et0 = (
-        pd.to_numeric(fut_wx["et0_mm"], errors="coerce").fillna(0.05).values
-        if "et0_mm" in fut_wx.columns
-        else np.full(n_hrs, float(now_row.get("et0_mm", 0.05)), dtype=float)
+    soil_col = (
+        "era5_soil_deep"
+        if "era5_soil_deep" in fut_wx.columns
+        else ("era5_soil_moisture" if "era5_soil_moisture" in fut_wx.columns else None)
+    )
+    default_soil = float(
+        now_row.get("era5_soil_deep", now_row.get("era5_soil_moisture", 0.36))
     )
     fut_soil = (
-        pd.to_numeric(fut_wx["era5_soil_moisture"], errors="coerce")
-        .fillna(float(now_row.get("era5_soil_moisture", 0.39)))
-        .values
-        if "era5_soil_moisture" in fut_wx.columns
-        else np.full(n_hrs, float(now_row.get("era5_soil_moisture", 0.39)), dtype=float)
+        pd.to_numeric(fut_wx[soil_col], errors="coerce").fillna(default_soil).values
+        if soil_col is not None
+        else np.full(n_hrs, default_soil, dtype=float)
     )
 
     a168 = 1.0 - np.exp(-np.log(2) / 168.0)
-    t168 = float(now_row.get("tank_168h", 0.5))
+    rt168 = float(now_row.get("ref_tank_168h", now_row.get("tank_168h", 0.3)))
     tank_168_vals = np.empty(n_hrs, dtype=float)
     for step in range(n_hrs):
-        net_step = max(0.0, float(fut_rain[step]) - 0.8 * float(fut_et0[step]))
-        t168 = (1.0 - a168) * t168 + a168 * net_step
-        tank_168_vals[step] = t168
+        rt168 = (1.0 - a168) * rt168 + a168 * float(fut_rain[step])
+        tank_168_vals[step] = rt168
 
-    s_min = float(now_row.get("soil_min", 0.30))
+    s_min = float(now_row.get("soil_min", 0.25))
     s_max = float(now_row.get("soil_max", 0.43))
-    t95 = float(now_row.get("tank_168h_p95", 0.5))
+    t95 = float(now_row.get("tank_168h_p95", 0.45))
     if np.isnan(s_min):
-        s_min = 0.30
+        s_min = 0.25
     if np.isnan(s_max):
         s_max = 0.43
     if np.isnan(t95) or t95 <= 0.0:
-        t95 = 0.5
+        t95 = 0.45
 
-    sat_norm = np.clip((fut_soil - s_min) / (s_max - s_min + 1e-6), 0.05, 1.0)
-    tank_norm = np.clip(tank_168_vals / (t95 + 1e-6), 0.05, 1.5)
-    moist = 0.5 * sat_norm + 0.5 * tank_norm
+    tank_norm = np.clip(tank_168_vals / (t95 + 1e-6), 0.05, 1.15)
+    sat_raw = np.clip((fut_soil - s_min) / (s_max - s_min + 1e-6), 0.05, 1.0)
+    sat_norm = np.minimum(sat_raw, tank_norm + 0.25)
+    moist = np.clip(0.35 * sat_norm + 0.65 * tank_norm, 0.05, 1.0)
     moist = np.where(np.isnan(moist), 0.5, moist)
     return pd.Series(moist, index=fut_wx.index, dtype=float, name="moisture_index")
 
 
 def compute_nwp_ensemble_quantiles(
-    raw_stack: np.ndarray, det_rain: np.ndarray
+    raw_stack: np.ndarray,
+    det_rain: np.ndarray,
+    model_names: Sequence[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute volume-conserved NWP ensemble P10, P50, P90 rain and 48h spread.
 
     Evaluates the 2-model wet quorum (>= 0.6 mm/h) on ``raw_stack`` BEFORE filling missing
     (NaN) member values with ``det_rain``. Supports both 2D ``(M, T)`` and 3D ``(M, N, T)`` inputs.
+    When ``model_names`` is provided, uses lead-aware European/convection-permitting weights for
+    ``lead_h > 6`` while preserving ``0.5 * det + 0.5 * median`` for ``lead_h <= 6``.
     """
     raw_arr = np.asarray(raw_stack, dtype=float)
     det_arr = np.nan_to_num(np.asarray(det_rain, dtype=float), nan=0.0)
@@ -437,7 +495,42 @@ def compute_nwp_ensemble_quantiles(
         np.minimum(raw_ens_max, 0.5 * (ens_med + raw_ens_max)),
     )
 
-    rain_p50 = np.round(0.5 * det_arr + 0.5 * ens_med, 2)
+    base_p50 = 0.5 * det_arr + 0.5 * ens_med
+    n_steps = raw_arr.shape[-1] if raw_arr.ndim >= 2 else 0
+    if model_names is not None and len(model_names) == raw_arr.shape[0] and n_steps > 0:
+        lead_h = np.arange(1, n_steps + 1)
+        w_med_map = {
+            "ukmo_seamless": 0.35,
+            "ecmwf_ifs025": 0.30,
+            "meteofrance_seamless": 0.25,
+            "icon_seamless": 0.10,
+        }
+        w_long_map = {
+            "ukmo_seamless": 0.30,
+            "ecmwf_ifs025": 0.30,
+            "icon_seamless": 0.20,
+            "meteofrance_seamless": 0.20,
+        }
+        w_med_vec = np.array([w_med_map.get(str(m), 0.0) for m in model_names], dtype=float)
+        w_long_vec = np.array([w_long_map.get(str(m), 0.0) for m in model_names], dtype=float)
+        if raw_arr.ndim == 2:
+            w = np.where(lead_h[None, :] <= 30, w_med_vec[:, None], w_long_vec[:, None])
+        else:
+            w = np.where(
+                lead_h[None, None, :] <= 30, w_med_vec[:, None, None], w_long_vec[:, None, None]
+            )
+        valid_m = ~np.isnan(raw_arr)
+        w_eff = np.where(valid_m, w, 0.0)
+        w_sum = np.sum(w_eff, axis=0)
+        weighted_mean = np.where(
+            w_sum > 0.0,
+            np.sum(np.where(valid_m, raw_arr, 0.0) * w_eff, axis=0) / np.maximum(w_sum, 1e-6),
+            base_p50,
+        )
+        rain_p50 = np.round(np.where(lead_h > 6, weighted_mean, base_p50), 2)
+    else:
+        rain_p50 = np.round(base_p50, 2)
+
     rain_p10 = np.round(np.minimum(rain_p50, ens_min), 2)
 
     member_totals_48h = np.sum(stack_filled[..., :48], axis=-1)
@@ -451,7 +544,7 @@ def compute_nwp_ensemble_quantiles(
 
     vol_scale = np.where(
         (raw_p90_sum > 1e-3) & (target_p90_total > 0.0),
-        np.clip(target_p90_total / np.maximum(raw_p90_sum, 1e-6), 0.55, 1.15),
+        np.clip(target_p90_total / np.maximum(raw_p90_sum, 1e-6), 0.85, 1.25),
         1.0,
     )
     rain_p90 = np.round(
@@ -520,7 +613,11 @@ def enrich_nwp_ensemble_quantiles(
         raw_stack = np.vstack(
             [pd.to_numeric(df_w[c], errors="coerce").values.astype(float) for c in avail_cols]
         )
-        rain_p10, rain_p50, rain_p90, _ = compute_nwp_ensemble_quantiles(raw_stack, det_rain)
+        rain_p10, rain_p50, rain_p90, _ = compute_nwp_ensemble_quantiles(
+            raw_stack,
+            det_rain,
+            model_names=[c.replace("nwp_", "") for c in avail_cols],
+        )
         members_summary = [
             {
                 "id": col.replace("nwp_", ""),
@@ -659,17 +756,17 @@ def apply_hydrological_guardrails(
     obs_conf = np.asarray(obs_rain_confirmed, dtype=bool)
 
     sat_factor = np.clip(m_idx**1.5, 0.15, 1.0)
-    sponge_deduct = np.where(t168 < 0.5, 8.0, 0.0)
+    if horizon_h <= 3:
+        sponge_deduct = np.where(t168 < 0.5, 8.0, 0.0)
 
-    # P90 (and P50 for h > 6h) can respond to NWP future rain
-    rain_avail_nwp = r3h + rfut
-    eff_rain_nwp = np.maximum(0.0, rain_avail_nwp - sponge_deduct) * sat_factor
-    max_phys_rise_nwp = 25.0 + 12.0 * eff_rain_nwp
-    max_rate_rise_nwp = np.where(eff_rain_nwp < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
-    allowed_rise_nwp = np.minimum(max_phys_rise_nwp, max_rate_rise_nwp)
+        # P90 (and P50 for h > 6h) can respond to NWP future rain
+        rain_avail_nwp = r3h + rfut
+        eff_rain_nwp = np.maximum(0.0, rain_avail_nwp - sponge_deduct) * sat_factor
+        max_phys_rise_nwp = 25.0 + 12.0 * eff_rain_nwp
+        max_rate_rise_nwp = np.where(eff_rain_nwp < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
+        allowed_rise_nwp = np.minimum(max_phys_rise_nwp, max_rate_rise_nwp)
 
-    # Short-range (+1..+6h) P50 ignores unconfirmed NWP drizzle (<10mm) or NWP when gauges are offline
-    if horizon_h <= 6:
+        # Short-range (+1..+3h) P50 ignores unconfirmed NWP drizzle (<10mm) or NWP when gauges are offline
         r3h_obs = np.where(obs_conf, r3h, 0.0)
         rfut_p50 = np.where(obs_conf & ((r3h_obs > 0.5) | (rfut >= 10.0)), rfut, 0.0)
         eff_rain_obs = np.maximum(0.0, r3h_obs + rfut_p50 - sponge_deduct) * sat_factor
@@ -677,7 +774,19 @@ def apply_hydrological_guardrails(
         max_rate_rise_obs = np.where(eff_rain_obs < 20.0, np.maximum(35.0, 30.0 * horizon_h), 9999.0)
         allowed_rise_p50 = np.minimum(max_phys_rise_obs, max_rate_rise_obs)
     else:
-        allowed_rise_p50 = allowed_rise_nwp
+        sponge_deduct = np.where(t168 < 0.12, 8.0, 0.0)
+
+        rain_avail_nwp = r3h + rfut
+        eff_rain_nwp = np.maximum(0.0, rain_avail_nwp - sponge_deduct) * sat_factor
+        allowed_rise_nwp = 25.0 + 60.0 * eff_rain_nwp
+
+        if horizon_h <= 6:
+            r3h_obs = np.where(obs_conf, r3h, 0.0)
+            rfut_p50 = np.where(obs_conf & ((r3h_obs > 0.5) | (rfut >= 6.0)), rfut, 0.0)
+            eff_rain_obs = np.maximum(0.0, r3h_obs + rfut_p50 - sponge_deduct) * sat_factor
+            allowed_rise_p50 = 25.0 + 60.0 * eff_rain_obs + np.maximum(0.0, dd1) * 1.5
+        else:
+            allowed_rise_p50 = allowed_rise_nwp
 
     # Apply clamp only when base depth is below Amber (< 620 mm) and not already surging (ddepth_1h < 15 mm)
     clamp_mask = (b_d < AMBER_DEPTH_MM) & (dd1 < 15.0)
@@ -705,6 +814,42 @@ def apply_hydrological_guardrails(
     if is_scalar:
         return float(clamped_p10), float(clamped_p50), float(clamped_p90)
     return clamped_p10, clamped_p50, clamped_p90
+
+
+def apply_dry_conformal_padding(
+    base_depth: np.ndarray | float,
+    ddepth_1h: np.ndarray | float,
+    fut_rain_sum: np.ndarray | float,
+    d_p10: np.ndarray | float,
+    d_p50: np.ndarray | float,
+    d_p90: np.ndarray | float,
+    pad_dry_mm: float = 0.0,
+) -> tuple[np.ndarray | float, np.ndarray | float, np.ndarray | float]:
+    """Apply smooth quiescent-regime split-conformal band padding without crossing RED alert thresholds."""
+    if pad_dry_mm <= 0.0:
+        return d_p10, d_p50, d_p90
+
+    is_scalar = np.isscalar(base_depth) or isinstance(base_depth, float)
+    b_d = np.asarray(base_depth, dtype=float)
+    dd1 = np.asarray(ddepth_1h, dtype=float)
+    rfut = np.maximum(0.0, np.asarray(fut_rain_sum, dtype=float))
+    dp10 = np.asarray(d_p10, dtype=float)
+    dp50 = np.asarray(d_p50, dtype=float)
+    dp90 = np.asarray(d_p90, dtype=float)
+
+    w_dry = np.clip(1.0 - rfut / 3.0, 0.0, 1.0) * np.clip(1.0 - np.abs(dd1) / 8.0, 0.0, 1.0)
+    pad = w_dry * float(pad_dry_mm)
+    out_p10 = dp10 - pad
+    raw_hi = dp90 + pad
+    out_p90 = np.where(
+        (b_d < RED_CLEAR_DEPTH_MM) & ((b_d + dp90) < RED_DEPTH_MM),
+        np.minimum(raw_hi, RED_DEPTH_MM - 2.0 - b_d),
+        raw_hi,
+    )
+
+    if is_scalar:
+        return float(out_p10), float(dp50), float(out_p90)
+    return out_p10, dp50, out_p90
 
 
 def reconstruct_depth_quantiles(

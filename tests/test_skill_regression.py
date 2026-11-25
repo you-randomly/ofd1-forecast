@@ -65,3 +65,9 @@ def test_out_of_sample_2026_skill_gates_and_coverage_fix() -> None:
         assert row["coverage_pct"] >= 66.0
         assert row["f1_600_p50"] >= base_h["f1_600_p50"] - tolerances["max_f1_regression"]
         assert row["f1_700_p90"] >= base_h["f1_700_p90"] - tolerances["max_f1_regression"]
+        if h >= 6:
+            assert row["cross_red_p50_pod_pct"] >= 80.0
+            assert row["cross_red_p90_pod_pct"] >= 90.0
+
+    assert ens_rows.loc[48, "rmse_p50_mm"] <= 110.0
+    assert ens_rows.loc[48, "flood_rmse_p50_mm"] <= 156.0

@@ -77,11 +77,10 @@ def test_stump_glitch_filter_bounds(synthetic_hourly_df: pd.DataFrame) -> None:
 def test_asymmetric_fut_ref_tank_24h_and_rolling_equivalence(
     synthetic_hourly_df: pd.DataFrame,
 ) -> None:
-    """Verify attach_horizon_future_cols preserves fut_ref_tank_24h = tank_24h.shift(-h) and matches roll_future_features_for_horizon."""
+    """Verify attach_horizon_future_cols and roll_future_features_for_horizon match bit-for-bit across all nwp cols."""
+    from app.hydrology import nwp_cols_for_horizon
+
     df_in = synthetic_hourly_df.copy()
-    # Make fused_rain_mm equal rain_mm across future window so tank_24h and roll_future_features_for_horizon see identical rain
-    df_in["swcc_rain_mm"] = df_in["rain_mm"]
-    df_in["stump_rain_mm"] = df_in["rain_mm"]
     df_feat = engineer_features(df_in)
 
     issue_idx = df_feat.index[390:405]
@@ -91,14 +90,13 @@ def test_asymmetric_fut_ref_tank_24h_and_rolling_equivalence(
 
     for h in HORIZONS:
         attached = attach_horizon_future_cols(df_feat, h)
-        # Verify asymmetric definition: 6h and 96h shift ref_tank, 24h shifts tank_24h
         np.testing.assert_allclose(
             attached.loc[issue_idx, "fut_ref_tank_6h"].values,
             df_feat["ref_tank_6h"].shift(-h).loc[issue_idx].values,
         )
         np.testing.assert_allclose(
             attached.loc[issue_idx, "fut_ref_tank_24h"].values,
-            df_feat["tank_24h"].shift(-h).loc[issue_idx].values,
+            df_feat["ref_tank_24h"].shift(-h).loc[issue_idx].values,
         )
         np.testing.assert_allclose(
             attached.loc[issue_idx, "fut_ref_tank_96h"].values,
@@ -106,21 +104,13 @@ def test_asymmetric_fut_ref_tank_24h_and_rolling_equivalence(
         )
 
         rolled = roll_future_features_for_horizon(df_feat, issue_idx, fut_rain_mat, h)
-        for col in ["fut_ref_tank_6h", "fut_ref_tank_24h", "fut_ref_tank_96h", "fut_rain_sum_6h_at_target", "fut_rain_sum_12h_at_target"]:
+        for col in nwp_cols_for_horizon(h):
             np.testing.assert_allclose(
                 rolled[col].values,
                 attached.loc[issue_idx, col].values,
                 rtol=1e-10,
                 atol=1e-10,
                 err_msg=f"Mismatch in {col} at horizon +{h}h",
-            )
-        for k in range(min(h, 6)):
-            col_k = f"fut_rain_minus_{k}h_from_target"
-            np.testing.assert_allclose(
-                rolled[col_k].values,
-                attached.loc[issue_idx, col_k].values,
-                rtol=1e-10,
-                atol=1e-10,
             )
 
 
@@ -472,3 +462,117 @@ def test_nrw_historical_payload_and_target_filtering() -> None:
     ser, meta = parse_nrw_rainfall_payload(hist_payloads, exclude_station_ids=NRW_EXCLUDED_STATION_IDS)
     assert meta["stations_matched"] == 2
     assert ser.loc[pd.Timestamp("2026-11-10T18:00:00Z")] == 1.3
+
+
+def test_guardrails_preserve_early_window_flood_at_long_horizons() -> None:
+    """Cumulative [t0+1..t0+h] storm rain at h=24 must not be clamped when rain occurred early."""
+    d10, d50, d90 = apply_hydrological_guardrails(
+        base_depth=540.0,
+        ddepth_1h=0.0,
+        fused_rain_3h=0.0,
+        moisture_index=0.75,
+        tank_168h=0.25,
+        horizon_h=24,
+        fut_rain_sum=18.0,
+        d_p10=280.0,
+        d_p50=350.0,
+        d_p90=480.0,
+    )
+    assert d50 == 350.0
+    assert d90 == 480.0
+    assert d10 == 280.0
+
+    # Dry summer peat with zero future rain remains clamped at +25 mm
+    _, d50_dry, _ = apply_hydrological_guardrails(
+        base_depth=540.0,
+        ddepth_1h=0.0,
+        fused_rain_3h=0.0,
+        moisture_index=0.30,
+        tank_168h=0.08,
+        horizon_h=24,
+        fut_rain_sum=0.0,
+        d_p10=160.0,
+        d_p50=200.0,
+        d_p90=260.0,
+    )
+    assert d50_dry == 25.0
+
+
+def test_lead_aware_nwp_ensemble_quantiles_weights_and_nan_renorm() -> None:
+    """Lead > 6h uses European/convection-permitting weights and ignores best_match/gfs_seamless."""
+    from app.hydrology import NWP_MODELS
+
+    raw_2d = np.zeros((len(NWP_MODELS), 48), dtype=float)
+    for idx, slug in enumerate(NWP_MODELS):
+        if slug not in ("best_match", "gfs_seamless"):
+            raw_2d[idx, :] = 4.0
+    det_2d = np.zeros(48, dtype=float)
+
+    _, p50, _, _ = compute_nwp_ensemble_quantiles(raw_2d, det_2d, model_names=NWP_MODELS)
+    # lead_h <= 6 preserves 0.5 * det + 0.5 * median = 0.5 * 0 + 0.5 * 4.0 = 2.0
+    np.testing.assert_allclose(p50[:6], 2.0)
+    # lead_h > 6 drops best_match & gfs_seamless -> exact 4.0
+    np.testing.assert_allclose(p50[6:], 4.0)
+
+    # Missing meteofrance_seamless member must renormalize remaining weights to 4.0 without NaNs
+    raw_nan = raw_2d.copy()
+    raw_nan[NWP_MODELS.index("meteofrance_seamless"), :] = np.nan
+    _, p50_nan, _, _ = compute_nwp_ensemble_quantiles(raw_nan, det_2d, model_names=NWP_MODELS)
+    assert not np.isnan(p50_nan).any()
+    np.testing.assert_allclose(p50_nan[6:], 4.0)
+
+
+def test_partial_clog_rain_gauge_quarantine(synthetic_hourly_df: pd.DataFrame) -> None:
+    """A club gauge recording <25% of peer/reference over a >=15 mm 72h wet window is masked."""
+    df_in = synthetic_hourly_df.copy()
+    idx_win = slice(300, 372)
+    df_in.iloc[idx_win, df_in.columns.get_loc("rain_mm")] = 1.0  # 72 mm total
+    df_in.iloc[idx_win, df_in.columns.get_loc("stump_rain_mm")] = 1.2
+    df_in.iloc[idx_win, df_in.columns.get_loc("swcc_rain_mm")] = 0.05  # ~3.6 mm (<25%)
+
+    df_feat = engineer_features(df_in)
+    assert df_feat["swcc_status"].iloc[371] == "stuck_zero"
+    assert df_feat["rain_source"].iloc[371] == "stump"
+    assert df_feat["fused_rain_mm"].iloc[371] == 1.2
+
+
+def test_dry_conformal_padding_widens_quiescent_band_without_false_red() -> None:
+    """Dry CQR padding widens quiescent bands, tapers to 0 under heavy rain, and caps below 700 mm."""
+    from app.hydrology import apply_dry_conformal_padding
+
+    d10_q, d50_q, d90_q = apply_dry_conformal_padding(
+        base_depth=580.0,
+        ddepth_1h=0.0,
+        fut_rain_sum=0.0,
+        d_p10=-5.0,
+        d_p50=0.0,
+        d_p90=6.0,
+        pad_dry_mm=15.0,
+    )
+    assert d10_q == -20.0
+    assert d50_q == 0.0
+    assert d90_q == 21.0
+
+    # Near RED threshold (still < RED_CLEAR_DEPTH_MM and P90 < 700), capped at 698.0
+    _, _, d90_cap = apply_dry_conformal_padding(
+        base_depth=670.0,
+        ddepth_1h=0.0,
+        fut_rain_sum=0.0,
+        d_p10=-5.0,
+        d_p50=5.0,
+        d_p90=20.0,
+        pad_dry_mm=15.0,
+    )
+    assert 670.0 + d90_cap == 698.0
+
+    # Under heavy rain (>=3 mm), dry padding tapers completely to zero
+    d10_w, d50_w, d90_w = apply_dry_conformal_padding(
+        base_depth=580.0,
+        ddepth_1h=0.0,
+        fut_rain_sum=5.0,
+        d_p10=-5.0,
+        d_p50=10.0,
+        d_p90=30.0,
+        pad_dry_mm=15.0,
+    )
+    assert (d10_w, d50_w, d90_w) == (-5.0, 10.0, 30.0)
